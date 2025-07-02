@@ -4,14 +4,16 @@ b2c_img = 'tif or btf'
 model_path = 'precomputed celltypist model path, if don't have set model = False'
 sc_ref = 'single cell reference data'
 
+#paremeters
 crop = False
 use_sc = True
 normalize = True
-feature_name = False
+feature_name = False #single cell data use feature name or not
 skipb2c = True
-L = 0.5
-n_top_genes = 5000
+L = 0.5  #Lambda
+n_top_genes = 5000 #
 
+#cmap example
 # cmap = {
 #     'B cell': '#7A57D1',
 #     'endothelial cell': '#FF731D',
