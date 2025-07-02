@@ -1,8 +1,8 @@
-work_path = '/home/xh300/link/spa/newmethod/Rep2_normalized_all'
-visium_path = '/home/xh300/link/spa/sthd/STHD/notebooks/data/rachel/rep2'
-b2c_img = '/home/xh300/link/spa/sthd/STHD/notebooks/data/rachel/rep2/Jej1_IB5_20241106_resized_50_quality_90.jpg'
-model_path = '/home/xh300/link/spa/sthd/STHD/notebooks/data/rachel/rep2/rep2.pkl'
-sc_ref = '/home/xh300/link/spa/sthd/STHD/notebooks/data/rachel/GSE214821PaperNerve_pp.h5ad'
+work_path = 'Result folder'
+visium_path = 'visium data path, should have filtered_feature_bc_matrix.h5 and spatial folder'
+b2c_img = 'tif or btf'
+model_path = 'precomputed celltypist model path, if don't have set model = False'
+sc_ref = 'single cell reference data'
 
 crop = False
 use_sc = True
