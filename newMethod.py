@@ -1,17 +1,22 @@
 work_path = 'Result folder'
 visium_path = 'visium data path, should have filtered_feature_bc_matrix.h5 and spatial folder'
 b2c_img = 'tif or btf'
-model_path = 'precomputed celltypist model path, if don't have set model = False'
-sc_ref = 'single cell reference data'
+model_path = 'precomputed celltypist model path, if don't have set model = False and provide a path to store the new model data'
+sc_ref = 'single cell reference data， should have cell type label stored in cell_type if you want to train model'
 
 #paremeters
 crop = False
 use_sc = True
 normalize = True
-feature_name = False #single cell data use feature name or not
+model = True    #train celltypist model or not
+feature_name = False    #single cell data use feature name or not
 skipb2c = True
-L = 0.5  #Lambda
-n_top_genes = 5000 #
+L = 0.5    #Lambda
+n_top_genes = 5000
+
+cmap = {
+#color map
+}
 
 #cmap example
 # cmap = {
@@ -29,29 +34,6 @@ n_top_genes = 5000 #
 #     'ambiguous': '#d3d3d3',
 #     'filtered': '#848884'
 # }
-
-
-cmap = {
-    'EC -villi base': '#1f77b4',
-    'EC': '#ff7f0e',
-    'EC-TA': '#2ca02c',
-    'Progenitor': '#d62728',
-    'Tuft': '#00FF7F',
-    'B cell': '#2E8B57',
-    'Endothelial': '#e377c2',
-    'Goblet': '#7f7f7f',
-    'Villi tip': '#bcbd22',
-    'T cell': '#17becf',
-    'TA': '#98FB98',
-    'Paneth cell': "#730fec",
-    'Mesenchyme': '#7570b3',
-    'EEC':"#984ea3",
-    'SC':"#708090",
-    'Myeloid-macrophage':"#ffff33",
-    'Microglial-macrophage':"#a65628",
-}
-
-
 
 def simple_scale(adata):
     X = adata.X
@@ -89,9 +71,13 @@ from scipy.spatial.distance import cdist
 import decoupler as dc
 from sklearn.metrics.pairwise import cosine_similarity
 
+import celltypist
+from celltypist import models
+
 from shapely.geometry import box
 from shapely.ops import unary_union
 import random
+
 if skipb2c != True:
 #b2c pipeline
     path = visium_path
@@ -392,10 +378,9 @@ pdata.write_h5ad('near_output.h5ad')
 
 
 #celltypist
-import scanpy as sc
-import celltypist
-from celltypist import models
-
+if not model:
+    new_model = celltypist.train(sc_ref, labels = 'cell_type',n_jobs = 16, feature_selection = True)
+    new_model.write(model_path)
 test = sc.read('near_output.h5ad')
 sc.pp.normalize_total(test,target_sum=10000)
 sc.pp.log1p(test)
