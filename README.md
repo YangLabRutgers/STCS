@@ -1,6 +1,5 @@
 # STCS: Spatial Transceiptomics Cell Segmentation
 <img width="1451" height="1429" alt="image" src="https://github.com/user-attachments/assets/01cac294-32ef-41c2-89ff-7bc2dad2294f" />
-<img width="1451" height="1429" alt="image" src="https://github.com/user-attachments/assets/01cac294-32ef-41c2-89ff-7bc2dad2294f" />
 
 Here is STCS, a pipeline that reconstruct subcellular barcodes from sequence-based Spatial Transceiptomics data into single cell level segmented data.
 
