@@ -71,7 +71,7 @@ mpl.rcParams["font.sans-serif"] = [FONT_NAME]
 # ============================================================
 # SHARED CONFIG
 # ============================================================
-BASE_DIR = "/home/xh300/link/spa/newmethod/SpatialMethod/all_para"
+BASE_DIR = "../all_para"
 CROPS = ["crop1", "crop2", "crop3", "crop4", "crop5"]
 param_re = re.compile(r"L=([\d.]+)S=([\d.]+)")
 
