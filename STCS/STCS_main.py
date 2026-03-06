@@ -33,6 +33,15 @@ from scipy.sparse import issparse
 import anndata as ad
 from anndata import AnnData
 
+import shutil
+import random
+import itertools
+import matplotlib.patches as patches
+import glob
+import re
+from collections import deque
+import matplotlib.colors as mcolors
+
 from config import (
     prob_thresh,stardist_model,n_tiles, min_cells,
     target_sum, n_top_genes,L, batch_size, search_radius as default_search_radius, assignment_mode, empty,
@@ -473,7 +482,7 @@ class STCS:
         stcs._barcode_data_path = metadata.get("_barcode_data_path")  
         stcs._cell_data_path = metadata.get("_cell_data_path")        
         stcs._dc_pseudobulk_data_path = metadata.get("_dc_pseudobulk_data_path")
-        stcs._dc_assignment_pseudobulk_data_path = metadata.get("_dc_assignment_pseudobulk_dFnata_path")
+        stcs._dc_assignment_pseudobulk_data_path = metadata.get("_dc_assignment_pseudobulk_data_path")
         stcs._celltypist_results_path =  metadata.get("_celltypist_results_path")
         cropped_img_path = metadata.get("cropped_img_path")
         if cropped_img_path:
@@ -1435,3 +1444,731 @@ class STCS:
         # overwrite the obs column
         self.adata.obs['assigned_cell_id'] = new_assign
         print("[Log]: Filled isolated holes within original x/y bounds based on neighbor consensus.")
+
+
+    def _rect_to_xyxy(self, rect):
+        """
+        Convert (x, y, w, h) -> (x1, x2, y1, y2)
+        """
+        x, y, w, h = rect
+        return x, x + w, y, y + h
+    
+    
+    
+    def count_spatial_points_in_rect(self, rect, adata=None):
+        """
+        Count how many spatial coordinates fall inside the crop rectangle.
+
+        Parameters
+        ----------
+        rect : tuple
+            (x, y, w, h) in image pixel coordinates
+        adata : AnnData or None
+            If None, use self.adata
+
+        Returns
+        -------
+        int
+            Number of spatial coordinates inside the rectangle
+        """
+        if adata is None:
+            adata = self.adata
+
+        if "spatial" not in adata.obsm:
+            raise ValueError("No spatial coordinates found in adata.obsm['spatial'].")
+
+        x1, x2, y1, y2 = self._rect_to_xyxy(rect)
+
+        coords = adata.obsm["spatial"]
+        xs = coords[:, 0]
+        ys = coords[:, 1]
+
+        mask = (xs >= x1) & (xs < x2) & (ys >= y1) & (ys < y2)
+        return int(np.sum(mask))
+    
+    
+    def generate_random_crops(
+        self,
+        n_crops=5,
+        crop_w=3000,
+        crop_h=3000,
+        min_spots=500,
+        seed=123,
+        max_tries_per_crop=200,
+        use_image_boundary=True,
+        verbose=True,
+        allow_overlap=False,
+        min_gap=0
+    ):
+        """
+        Generate random crop rectangles, keeping only those that contain
+        at least `min_spots` spatial coordinates.
+
+        Parameters
+        ----------
+        n_crops : int
+            Number of crops to generate
+        crop_w, crop_h : int
+            Crop width and height in image pixel coordinates
+        min_spots : int
+            Minimum number of spatial coordinates required inside crop
+        seed : int
+            Random seed
+        max_tries_per_crop : int
+            Maximum tries per requested crop
+        use_image_boundary : bool
+            If True, sample only inside loaded image boundary
+        verbose : bool
+            Print debug information
+        allow_overlap : bool
+            If False, accepted crops cannot overlap
+        min_gap : int
+            Minimum gap between accepted crops in pixels
+
+        Returns
+        -------
+        rects : list of tuples
+            List of (x, y, w, h)
+        """
+        rng = np.random.default_rng(seed)
+
+        coords = self.adata.obsm["spatial"]
+        x_min = int(np.floor(np.nanmin(coords[:, 0])))
+        x_max = int(np.ceil(np.nanmax(coords[:, 0])))
+        y_min = int(np.floor(np.nanmin(coords[:, 1])))
+        y_max = int(np.ceil(np.nanmax(coords[:, 1])))
+
+        if use_image_boundary:
+            img = self.load_img()
+            if img is None:
+                raise RuntimeError("Failed to load image.")
+            img_h, img_w = img.shape[:2]
+
+            x_min = max(0, x_min)
+            y_min = max(0, y_min)
+            x_max = min(img_w, x_max)
+            y_max = min(img_h, y_max)
+
+        if verbose:
+            print(f"[Debug] valid region: x=({x_min}, {x_max}), y=({y_min}, {y_max})")
+
+        if (x_max - x_min) < crop_w or (y_max - y_min) < crop_h:
+            raise ValueError(
+                f"Crop size ({crop_w}, {crop_h}) is larger than valid region "
+                f"({x_max - x_min}, {y_max - y_min})."
+            )
+
+        rects = []
+        tries = 0
+        max_total_tries = max_tries_per_crop * max(1, n_crops)
+
+        while len(rects) < n_crops and tries < max_total_tries:
+            tries += 1
+
+            x = int(rng.integers(x_min, x_max - crop_w + 1))
+            y = int(rng.integers(y_min, y_max - crop_h + 1))
+            rect = (x, y, crop_w, crop_h)
+
+            n_inside = self.count_spatial_points_in_rect(rect)
+
+            if n_inside < min_spots:
+                if verbose:
+                    print(f"[Debug] try={tries}, rect={rect}, rejected: only {n_inside} spots")
+                continue
+
+            if not allow_overlap:
+                overlaps_existing = any(
+                    self._rectangles_overlap(rect, existing_rect, min_gap=min_gap)
+                    for existing_rect in rects
+                )
+                if overlaps_existing:
+                    if verbose:
+                        print(f"[Debug] try={tries}, rect={rect}, rejected: overlaps existing crop")
+                    continue
+
+            rects.append(rect)
+            if verbose:
+                print(f"[Debug] try={tries}, rect={rect}, accepted: {n_inside} spots")
+
+        if len(rects) < n_crops:
+            print(
+                f"[Warning]: Only found {len(rects)} valid crops out of requested {n_crops}. "
+                f"Try reducing n_crops, crop size, min_spots, or min_gap."
+            )
+
+        return rects
+    
+    def plot_crop_rectangles(self, rects, save_file=None, figsize=(12, 12)):
+        """
+        Plot crop rectangles on the full-resolution image.
+        rects: list of (x, y, w, h)
+        """
+        img = self.load_img()
+        if img is None:
+            raise RuntimeError("Failed to load full image for plotting.")
+
+        plt.figure(figsize=figsize)
+        plt.imshow(img)
+        plt.axis("off")
+        ax = plt.gca()
+
+        cmap = plt.cm.get_cmap("tab10", max(1, len(rects)))
+
+        for i, (x, y, w, h) in enumerate(rects):
+            color = cmap(i)
+            rect_patch = patches.Rectangle(
+                (x, y), w, h,
+                linewidth=2,
+                edgecolor=color,
+                facecolor="none"
+            )
+            ax.add_patch(rect_patch)
+            ax.text(
+                x, y - 10,
+                f"crop_{i+1}",
+                color=color,
+                fontsize=10,
+                weight="bold",
+                bbox=dict(facecolor="white", alpha=0.6, edgecolor="none")
+            )
+
+        if save_file is not None:
+            plt.savefig(save_file, dpi=200, bbox_inches="tight")
+
+        plt.show()
+        
+    def run_single_crop_parameter_set(
+        self,
+        rect,
+        crop_id,
+        search_radius,
+        lam,
+        results_dir,
+        tmp_root,
+        run_celltypist=True,
+        prob_thresh=0.1,
+        factor=1,
+        pseudobulk_mode="mean",
+        use_sc_ref=True,
+        normalize_distances=True,
+        feature_name=True
+    ):
+        """
+        Run one crop + one (search_radius, lambda) combination.
+        Keeps only the final h5ad file.
+        """
+        x, y, w, h = rect
+        x1, x2, y1, y2 = self._rect_to_xyxy(rect)
+
+        run_name = f"crop{crop_id:02d}_x{x}_y{y}_w{w}_h{h}_S{search_radius}_L{lam}"
+        tmp_dir = os.path.join(tmp_root, run_name)
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        final_h5ad = os.path.join(results_dir, f"{run_name}.h5ad")
+
+        try:
+            crop_data = self.crop(x1, x2, y1, y2, factor=factor)
+            if crop_data is None:
+                raise RuntimeError(f"Cropping failed for {run_name}")
+
+            crop_data = crop_data.run_stardist_pipeline(
+                path=tmp_dir,
+                prob_thresh=prob_thresh,
+                factor=factor
+            )
+
+            crop_data = crop_data.create_pseudobulk_from_stardist(
+                output_path=tmp_dir,
+                mode=pseudobulk_mode
+            )
+
+            crop_data = crop_data.run_assignment(
+                output_path=tmp_dir,
+                use_sc_ref=use_sc_ref,
+                search_radius=search_radius,
+                L=lam,
+                normalize_distances=normalize_distances,
+                feature_name=feature_name
+            )
+
+            if run_celltypist:
+                crop_data = crop_data.run_celltypist_annotation(
+                    output_path=tmp_dir,
+                    train_celltypist_model=False
+                )
+
+            crop_data.adata.write_h5ad(final_h5ad)
+
+            out = {
+                "run_name": run_name,
+                "crop_id": crop_id,
+                "x": x, "y": y, "w": w, "h": h,
+                "x1": x1, "x2": x2, "y1": y1, "y2": y2,
+                "search_radius": search_radius,
+                "lambda": lam,
+                "n_spots": int(crop_data.adata.n_obs),
+                "n_genes": int(crop_data.adata.n_vars),
+                "output_h5ad": final_h5ad,
+                "status": "success",
+            }
+
+        except Exception as e:
+            out = {
+                "run_name": run_name,
+                "crop_id": crop_id,
+                "x": x, "y": y, "w": w, "h": h,
+                "x1": x1, "x2": x2, "y1": y1, "y2": y2,
+                "search_radius": search_radius,
+                "lambda": lam,
+                "n_spots": None,
+                "n_genes": None,
+                "output_h5ad": None,
+                "status": f"failed: {repr(e)}",
+            }
+
+        finally:
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return out
+
+    def run_parameter_sweep(
+        self,
+        rects,
+        search_radii,
+        lambdas,
+        results_dir,
+        tmp_root=None,
+        run_celltypist=True,
+        prob_thresh=0.1,
+        factor=1,
+        pseudobulk_mode="mean",
+        use_sc_ref=True,
+        normalize_distances=True,
+        feature_name=True,
+        summary_csv_name="run_summary.csv"
+    ):
+        """
+        Run all crop x search_radius x lambda combinations.
+
+        Parameters
+        ----------
+        rects : list
+            List of (x, y, w, h)
+        search_radii : list
+            List of search radius values
+        lambdas : list
+            List of lambda values
+        """
+        os.makedirs(results_dir, exist_ok=True)
+
+        if tmp_root is None:
+            tmp_root = os.path.join(results_dir, "_tmp_runs")
+        os.makedirs(tmp_root, exist_ok=True)
+
+        all_results = []
+        param_grid = list(itertools.product(search_radii, lambdas))
+
+        print(f"[Log]: Number of crops = {len(rects)}")
+        print(f"[Log]: Number of parameter combinations per crop = {len(param_grid)}")
+        print(f"[Log]: Total runs = {len(rects) * len(param_grid)}")
+
+        for crop_idx, rect in enumerate(rects, start=1):
+            print("=" * 80)
+            print(f"[Log]: Running crop {crop_idx}/{len(rects)} | rect={rect}")
+            print("=" * 80)
+
+            for s, lam in param_grid:
+                print(f"[Log]: crop={crop_idx}, S={s}, L={lam}")
+
+                result = self.run_single_crop_parameter_set(
+                    rect=rect,
+                    crop_id=crop_idx,
+                    search_radius=s,
+                    lam=lam,
+                    results_dir=results_dir,
+                    tmp_root=tmp_root,
+                    run_celltypist=run_celltypist,
+                    prob_thresh=prob_thresh,
+                    factor=factor,
+                    pseudobulk_mode=pseudobulk_mode,
+                    use_sc_ref=use_sc_ref,
+                    normalize_distances=normalize_distances,
+                    feature_name=feature_name
+                )
+                all_results.append(result)
+                print(f"[Log]: {result['status']}")
+
+        summary_df = pd.DataFrame(all_results)
+        summary_csv = os.path.join(results_dir, summary_csv_name)
+        summary_df.to_csv(summary_csv, index=False)
+
+        print(f"[Log]: Sweep finished. Summary saved to {summary_csv}")
+        return summary_df
+    
+    def _rectangles_overlap(self, rect1, rect2, min_gap=0):
+        """
+        Check whether two rectangles overlap.
+
+        Parameters
+        ----------
+        rect1, rect2 : tuple
+            (x, y, w, h)
+        min_gap : int
+            Minimum required gap between rectangles.
+            min_gap=0 means rectangles may touch edges but not overlap.
+            min_gap>0 enforces separation.
+
+        Returns
+        -------
+        bool
+            True if overlapping (or too close), False otherwise.
+        """
+        x1, y1, w1, h1 = rect1
+        x2, y2, w2, h2 = rect2
+
+        left1, right1 = x1, x1 + w1
+        top1, bottom1 = y1, y1 + h1
+
+        left2, right2 = x2, x2 + w2
+        top2, bottom2 = y2, y2 + h2
+
+        # expand both boxes by min_gap rule
+        if right1 + min_gap <= left2:
+            return False
+        if right2 + min_gap <= left1:
+            return False
+        if bottom1 + min_gap <= top2:
+            return False
+        if bottom2 + min_gap <= top1:
+            return False
+
+        return True
+    
+    def _largest_connected_component_size(self, coords):
+        """
+        coords: iterable of (row, col) integer coordinates for one cell
+
+        Returns
+        -------
+        int
+            Size of the largest 8-connected component
+        """
+        coords = set((int(r), int(c)) for r, c in coords)
+        if len(coords) == 0:
+            return 0
+
+        visited = set()
+        largest = 0
+
+        neighbors = [
+            (-1, -1), (-1, 0), (-1, 1),
+            ( 0, -1),          ( 0, 1),
+            ( 1, -1), ( 1, 0), ( 1, 1),
+        ]
+
+        for start in coords:
+            if start in visited:
+                continue
+
+            q = deque([start])
+            visited.add(start)
+            comp_size = 0
+
+            while q:
+                r, c = q.popleft()
+                comp_size += 1
+
+                for dr, dc in neighbors:
+                    nxt = (r + dr, c + dc)
+                    if nxt in coords and nxt not in visited:
+                        visited.add(nxt)
+                        q.append(nxt)
+
+            if comp_size > largest:
+                largest = comp_size
+
+        return largest
+    
+    
+    def compute_connection_scores_from_adata(
+        self,
+        adata,
+        cell_col="assigned_cell_id",
+        row_col="array_row",
+        col_col="array_col",
+        exclude_unassigned=True
+    ):
+        """
+        Compute per-cell connection scores:
+            CS(c) = |largest connected component| / |all spots assigned to cell|
+        """
+        if cell_col not in adata.obs.columns:
+            raise ValueError(f"Missing '{cell_col}' in adata.obs")
+
+        if row_col not in adata.obs.columns or col_col not in adata.obs.columns:
+            raise ValueError(f"Need '{row_col}' and '{col_col}' in adata.obs")
+
+        df = adata.obs[[cell_col, row_col, col_col]].copy()
+        df[row_col] = pd.to_numeric(df[row_col], errors="coerce")
+        df[col_col] = pd.to_numeric(df[col_col], errors="coerce")
+        df = df.dropna(subset=[row_col, col_col])
+
+        if exclude_unassigned:
+            bad_vals = {"nan", "None", "none", "undefined", ""}
+            df = df[df[cell_col].notna()].copy()
+            df = df[~df[cell_col].astype(str).isin(bad_vals)].copy()
+
+        results = []
+
+        for cell_id, sub in df.groupby(cell_col):
+            coords = list(zip(sub[row_col].astype(int), sub[col_col].astype(int)))
+            n_total = len(coords)
+            if n_total == 0:
+                continue
+
+            lcc = self._largest_connected_component_size(coords)
+            conn = lcc / n_total
+
+            results.append({
+                "cell_id": str(cell_id),
+                "n_spots": int(n_total),
+                "largest_component_size": int(lcc),
+                "connection_score": float(conn),
+            })
+
+        out = pd.DataFrame(results)
+        if not out.empty:
+            out = out.sort_values(
+                ["connection_score", "n_spots"],
+                ascending=[False, False]
+            ).reset_index(drop=True)
+
+        return out
+    
+    def _parse_run_filename(self, path):
+        """
+        Parse filenames like:
+        crop01_x500_y500_w3000_h3000_S3_L2.h5ad
+        """
+        pattern = re.compile(
+            r"crop(?P<crop_id>\d+)_x(?P<x>-?\d+)_y(?P<y>-?\d+)_w(?P<w>\d+)_h(?P<h>\d+)_S(?P<S>[-+]?\d*\.?\d+)_L(?P<L>[-+]?\d*\.?\d+)\.h5ad$"
+        )
+
+        name = os.path.basename(path)
+        m = pattern.match(name)
+        if m is None:
+            return None
+
+        d = m.groupdict()
+        return {
+            "file": path,
+            "crop_id": int(d["crop_id"]),
+            "x": int(d["x"]),
+            "y": int(d["y"]),
+            "w": int(d["w"]),
+            "h": int(d["h"]),
+            "S": float(d["S"]),
+            "L": float(d["L"]),
+        }
+        
+    def compute_connection_scores_for_saved_runs(
+        self,
+        results_path,
+        output_dir_name="connection_scores",
+        cell_col="assigned_cell_id",
+        row_col="array_row",
+        col_col="array_col"
+    ):
+        """
+        Compute per-cell connection score CSV for each saved run (.h5ad),
+        and also save a per-run summary table.
+        """
+        h5ad_files = sorted(glob.glob(os.path.join(results_path, "*.h5ad")))
+        out_dir = os.path.join(results_path, output_dir_name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        records = []
+
+        for f in h5ad_files:
+            meta = self._parse_run_filename(f)
+            if meta is None:
+                print(f"[Skip]: filename not matched: {os.path.basename(f)}")
+                continue
+
+            print(f"[Log]: Processing {os.path.basename(f)}")
+            adata = sc.read_h5ad(f)
+
+            conn_df = self.compute_connection_scores_from_adata(
+                adata=adata,
+                cell_col=cell_col,
+                row_col=row_col,
+                col_col=col_col,
+                exclude_unassigned=True
+            )
+
+            out_csv = os.path.join(
+                out_dir,
+                os.path.basename(f).replace(".h5ad", "_connection_score.csv")
+            )
+            conn_df.to_csv(out_csv, index=False)
+
+            if conn_df.empty:
+                mean_conn = np.nan
+                std_conn = np.nan
+                n_cells = 0
+            else:
+                mean_conn = float(conn_df["connection_score"].mean())
+                std_conn = float(conn_df["connection_score"].std(ddof=0))
+                n_cells = int(conn_df.shape[0])
+
+            records.append({
+                **meta,
+                "connection_csv": out_csv,
+                "mean_connection_score": mean_conn,
+                "std_connection_score": std_conn,
+                "n_cells": n_cells,
+            })
+
+        summary = pd.DataFrame(records)
+        summary_csv = os.path.join(out_dir, "connection_score_summary_per_run.csv")
+        summary.to_csv(summary_csv, index=False)
+
+        print(f"[Log]: Saved per-run summary to {summary_csv}")
+        return summary
+    
+
+    def summarize_connection_across_crops(self, conn_run_summary):
+        """
+        Aggregate per-run mean connection score across crops
+        for each (L, S) combination.
+        """
+        df = conn_run_summary.copy()
+
+        grouped = (
+            df.groupby(["L", "S"], as_index=False)
+              .agg(
+                  mean_conn=("mean_connection_score", "mean"),
+                  std_conn=("mean_connection_score", lambda x: np.std(x, ddof=0)),
+                  n_crops=("crop_id", "nunique"),
+              )
+              .sort_values(["L", "S"])
+              .reset_index(drop=True)
+        )
+        return grouped
+    
+    def _annotate_heatmap_two_lines(
+        self,
+        ax,
+        i,
+        j,
+        mval,
+        sval,
+        cmap,
+        norm,
+        fmt_mean="{:.2f}",
+        fmt_std="±{:.2f}",
+        mean_fontsize=11,
+        std_fontsize=9,
+        y_offset_mean=-0.12,
+        y_offset_std=0.18
+    ):
+        rgba = cmap(norm(mval))
+        lum = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+        color = "black" if lum > 0.6 else "white"
+
+        ax.text(
+            j, i + y_offset_mean, fmt_mean.format(mval),
+            ha="center", va="center",
+            fontsize=mean_fontsize, color=color
+        )
+        ax.text(
+            j, i + y_offset_std, fmt_std.format(sval),
+            ha="center", va="center",
+            fontsize=std_fontsize, color=color
+        )
+        
+    def plot_connection_heatmap(
+        self,
+        conn_summary_df,
+        out_pdf=None,
+        out_svg=None,
+        title="Connection Score — mean ± std across crops"
+    ):
+        """
+        Plot heatmap of connection score summarized across crops.
+        """
+        if conn_summary_df.empty:
+            print("[connection] Empty dataframe, skip.")
+            return
+
+        mean_df = (
+            conn_summary_df
+            .pivot(index="L", columns="S", values="mean_conn")
+            .sort_index(axis=0)
+            .sort_index(axis=1)
+        )
+        std_df = (
+            conn_summary_df
+            .pivot(index="L", columns="S", values="std_conn")
+            .loc[mean_df.index, mean_df.columns]
+        )
+
+        norm = mcolors.Normalize(
+            vmin=np.nanmin(mean_df.values),
+            vmax=np.nanmax(mean_df.values)
+        )
+        cmap = plt.cm.RdYlGn
+
+        fig, ax = plt.subplots(figsize=(10, 7))
+        im = ax.imshow(
+            mean_df.values,
+            origin="lower",
+            aspect="auto",
+            cmap=cmap,
+            norm=norm,
+            interpolation="nearest"
+        )
+        im.set_rasterized(True)
+
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label("Mean Connection Score (higher = better)")
+
+        ax.set_xticks(np.arange(len(mean_df.columns)))
+        ax.set_xticklabels(mean_df.columns, rotation=45, ha="right")
+        ax.set_yticks(np.arange(len(mean_df.index)))
+        ax.set_yticklabels(mean_df.index)
+
+        ax.set_xlabel("S parameter")
+        ax.set_ylabel("L parameter")
+        ax.set_title(title)
+
+        for i in range(mean_df.shape[0]):
+            for j in range(mean_df.shape[1]):
+                mval = mean_df.values[i, j]
+                sval = std_df.values[i, j]
+
+                if np.isnan(mval):
+                    ax.text(j, i, "NA", ha="center", va="center", fontsize=11)
+                    continue
+
+                self._annotate_heatmap_two_lines(
+                    ax=ax,
+                    i=i,
+                    j=j,
+                    mval=mval,
+                    sval=sval,
+                    cmap=cmap,
+                    norm=norm
+                )
+
+        fig.tight_layout()
+
+        if out_pdf is not None:
+            fig.savefig(out_pdf, dpi=300)
+            print("[save]", out_pdf)
+        if out_svg is not None:
+            fig.savefig(out_svg)
+            print("[save]", out_svg)
+
+        plt.show()
