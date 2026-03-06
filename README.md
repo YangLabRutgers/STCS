@@ -79,7 +79,7 @@ This notebook converts Stereo-seq GEM files into AnnData (.h5ad) format compatib
 
 **Step 2 — Run STCS on Stereo-seq data**
 
-Run: **STCS_stereo-seq_tutorial.ipynb**
+You may run parameter tuning or run the tutorial directly: **STCS_stereo-seq_tutorial.ipynb**
 
 --- 
 
