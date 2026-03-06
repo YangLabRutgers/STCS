@@ -25,15 +25,11 @@ The STCS pipeline consists of the following steps:
 
 4. **Joint Transcriptomic–Spatial Distance Calculation**
 
-The assignment score between bin *i* and nucleus *c* is computed as:
+The assignment score between bin *i* and nucleus *c* is computed based on:
 
-   d(i,c) = d_expr(i,c) + λ * d_sp(i,c)
+- S (search radius) defines the spatial neighborhood for candidate nuclei.
 
-Where:
-
-S (search radius) defines the spatial neighborhood for candidate nuclei.
-
-λ (lambda) controls the weight of spatial distance relative to transcriptomic similarity.
+- λ (lambda) controls the weight of spatial distance relative to transcriptomic similarity.
 
 5. **Cell Reconstruction**
 Bins assigned to each nucleus are aggregated to form cell-level expression profiles.
