@@ -41,6 +41,10 @@ import glob
 import re
 from collections import deque
 import matplotlib.colors as mcolors
+import scipy.sparse as sp
+import matplotlib as mpl
+from matplotlib import font_manager
+import warnings
 
 from config import (
     prob_thresh,stardist_model,n_tiles, min_cells,
@@ -2172,3 +2176,1407 @@ class STCS:
             print("[save]", out_svg)
 
         plt.show()
+        
+    # ========== DETECTED GENES / CELL OVER PARAMETER SWEEP ==========
+
+    def _clean_cell_ids(self, series):
+        """
+        Normalize assigned cell IDs and convert invalid strings to NA.
+        """
+        s = pd.Series(series).astype("string").str.strip()
+        bad = {"nan", "None", "none", "undefined", ""}
+        s = s.where(~s.isin(bad), pd.NA)
+        return s
+
+    def detected_genes_per_reconstructed_cell(self, adata, cell_col="assigned_cell_id"):
+        """
+        From a spot-level AnnData, reconstruct per-cell counts by summing spots
+        assigned to the same cell, then count nonzero genes per cell.
+
+        Parameters
+        ----------
+        adata : AnnData
+            Spot-level AnnData from one saved run
+        cell_col : str
+            Column in adata.obs containing reconstructed cell assignments
+
+        Returns
+        -------
+        DataFrame
+            Columns:
+                - cell_id
+                - n_detected_genes
+                - n_spots
+        """
+        if cell_col not in adata.obs.columns:
+            raise ValueError(f"Missing '{cell_col}' in adata.obs")
+
+        cell_ids = self._clean_cell_ids(adata.obs[cell_col])
+        valid_mask = cell_ids.notna().to_numpy()
+
+        if valid_mask.sum() == 0:
+            return pd.DataFrame(columns=["cell_id", "n_detected_genes", "n_spots"])
+
+        X = adata.X[valid_mask]
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+        else:
+            X = X.tocsr()
+
+        groups = cell_ids[valid_mask].astype(str).to_numpy()
+        unique_groups, group_indices = np.unique(groups, return_inverse=True)
+
+        n_groups = len(unique_groups)
+        n_obs = len(groups)
+
+        # groups x spots membership matrix
+        M = sp.csr_matrix(
+            (np.ones(n_obs, dtype=np.float32), (group_indices, np.arange(n_obs))),
+            shape=(n_groups, n_obs),
+            dtype=np.float32
+        )
+
+        # summed expression per reconstructed cell
+        X_sum = (M @ X).tocsr()
+
+        # number of detected genes after summing all assigned spots
+        n_detected = np.asarray(X_sum.getnnz(axis=1)).ravel()
+
+        # number of spots per reconstructed cell
+        n_spots = np.asarray(M.sum(axis=1)).ravel().astype(int)
+
+        out = pd.DataFrame({
+            "cell_id": unique_groups.astype(str),
+            "n_detected_genes": n_detected.astype(int),
+            "n_spots": n_spots
+        })
+
+        return out.sort_values(
+            ["n_detected_genes", "n_spots"],
+            ascending=[False, False]
+        ).reset_index(drop=True)
+
+    def collect_shared_cell_ids_per_crop_from_success_df(
+        self,
+        success_df,
+        cell_col="assigned_cell_id"
+    ):
+        """
+        For each crop_id, find the intersection of reconstructed cell IDs
+        across all successful runs for that crop.
+
+        Parameters
+        ----------
+        success_df : DataFrame
+            Must contain:
+                - crop_id
+                - output_h5ad
+        cell_col : str
+            Assignment column inside each saved h5ad
+
+        Returns
+        -------
+        dict
+            {crop_id: set(shared_cell_ids)}
+        """
+        required = {"crop_id", "output_h5ad"}
+        missing = required - set(success_df.columns)
+        if missing:
+            raise ValueError(f"success_df missing required columns: {missing}")
+
+        shared = {}
+
+        for crop_id, sub in success_df.groupby("crop_id"):
+            sets = []
+            print(f"[shared] crop_id={crop_id}, runs={len(sub)}")
+
+            for _, row in sub.iterrows():
+                h5 = row["output_h5ad"]
+                if not os.path.exists(h5):
+                    continue
+
+                try:
+                    adata = sc.read_h5ad(h5)
+                    cell_df = self.detected_genes_per_reconstructed_cell(
+                        adata,
+                        cell_col=cell_col
+                    )
+                    ids = set(cell_df["cell_id"].astype(str).tolist())
+                    sets.append(ids)
+                except Exception as e:
+                    print(f"[Warning]: failed reading {h5}: {e}")
+                    continue
+
+            if len(sets) == 0:
+                shared[crop_id] = set()
+            else:
+                inter = sets[0]
+                for s in sets[1:]:
+                    inter = inter.intersection(s)
+                shared[crop_id] = inter
+
+            print(f"[shared] crop_id={crop_id}: {len(shared[crop_id])} shared cell_ids")
+
+        return shared
+
+    def mean_detected_genes_on_shared_cells(
+        self,
+        adata,
+        shared_ids_set,
+        cell_col="assigned_cell_id"
+    ):
+        """
+        Mean detected genes per reconstructed cell, restricted to shared cell IDs.
+        """
+        if not shared_ids_set:
+            return np.nan
+
+        cell_df = self.detected_genes_per_reconstructed_cell(
+            adata,
+            cell_col=cell_col
+        )
+        if cell_df.empty:
+            return np.nan
+
+        sub = cell_df[cell_df["cell_id"].isin(shared_ids_set)].copy()
+        if sub.empty:
+            return np.nan
+
+        return float(sub["n_detected_genes"].mean())
+
+    def summarize_detected_genes_shared_over_success_df(
+        self,
+        success_df,
+        shared_ids_per_crop,
+        cell_col="assigned_cell_id"
+    ):
+        """
+        For each (lambda, search_radius):
+          - for each crop: mean detected genes per reconstructed cell on shared cells
+          - aggregate across crops: mean ± std
+
+        Parameters
+        ----------
+        success_df : DataFrame
+            Must contain:
+                - run_name
+                - crop_id
+                - lambda
+                - search_radius
+                - output_h5ad
+        shared_ids_per_crop : dict
+            Output of collect_shared_cell_ids_per_crop_from_success_df()
+        cell_col : str
+            Assignment column in saved h5ad
+
+        Returns
+        -------
+        df_summary : DataFrame
+            Columns:
+                - L
+                - S
+                - mean_value
+                - std_value
+                - n_crops
+        df_per_run : DataFrame
+            Per-run values before crop aggregation
+        """
+        required = {"run_name", "crop_id", "lambda", "search_radius", "output_h5ad"}
+        missing = required - set(success_df.columns)
+        if missing:
+            raise ValueError(f"success_df missing required columns: {missing}")
+
+        records = []
+        per_run_records = []
+
+        for (L, S), sub in success_df.groupby(["lambda", "search_radius"]):
+            crop_vals = []
+
+            for _, row in sub.iterrows():
+                crop_id = row["crop_id"]
+                shared_ids = shared_ids_per_crop.get(crop_id, set())
+                h5 = row["output_h5ad"]
+
+                if not shared_ids or not os.path.exists(h5):
+                    continue
+
+                try:
+                    adata = sc.read_h5ad(h5)
+                    v = self.mean_detected_genes_on_shared_cells(
+                        adata,
+                        shared_ids_set=shared_ids,
+                        cell_col=cell_col
+                    )
+
+                    if np.isfinite(v):
+                        crop_vals.append(v)
+                        per_run_records.append({
+                            "run_name": row["run_name"],
+                            "crop_id": crop_id,
+                            "L": float(L),
+                            "S": float(S),
+                            "mean_detected_genes_shared_cells": float(v),
+                            "n_shared_cells": int(len(shared_ids)),
+                            "output_h5ad": h5,
+                        })
+
+                except Exception as e:
+                    print(f"[Warning]: failed summarizing {h5}: {e}")
+                    continue
+
+            if crop_vals:
+                records.append({
+                    "L": float(L),
+                    "S": float(S),
+                    "mean_value": float(np.mean(crop_vals)),
+                    "std_value": float(np.std(crop_vals, ddof=0)),
+                    "n_crops": int(len(crop_vals)),
+                })
+
+        df_summary = pd.DataFrame(records)
+        if not df_summary.empty:
+            df_summary = df_summary.sort_values(["L", "S"]).reset_index(drop=True)
+
+        df_per_run = pd.DataFrame(per_run_records)
+        if not df_per_run.empty:
+            df_per_run = df_per_run.sort_values(["L", "S", "crop_id"]).reset_index(drop=True)
+
+        return df_summary, df_per_run
+
+    def _setup_editable_vector_fonts(self, font_candidates=None):
+        """
+        Configure matplotlib for editable SVG/PDF text.
+        """
+        if font_candidates is None:
+            font_candidates = ["Helvetica"]
+
+        def pick_font(candidates):
+            for name in candidates:
+                try:
+                    fp = font_manager.FontProperties(family=name)
+                    path = font_manager.findfont(fp, fallback_to_default=False)
+                    if path and os.path.exists(path):
+                        return name, path
+                except Exception:
+                    pass
+            fp = font_manager.FontProperties()
+            path = font_manager.findfont(fp, fallback_to_default=True)
+            return fp.get_name(), path
+
+        font_name, font_path = pick_font(font_candidates)
+
+        mpl.rcParams["svg.fonttype"] = "none"
+        mpl.rcParams["font.family"] = "sans-serif"
+        mpl.rcParams["font.sans-serif"] = [font_name]
+        mpl.rcParams["pdf.fonttype"] = 42
+        mpl.rcParams["ps.fonttype"] = 42
+
+        print(f"[font] Using: {font_name}")
+        print(f"[font] Path : {font_path}")
+
+    def plot_detected_genes_across_S_by_L(
+        self,
+        df_summary,
+        out_svg=None,
+        title="Shared-cell mean #detected genes per reconstructed cell — across S"
+    ):
+        """
+        Plot x=S, one line per L, errorbar=std across crops.
+        """
+        if df_summary.empty:
+            print("[plot] Empty df, skipping.")
+            return
+
+        d = df_summary.copy()
+        d["S"] = d["S"].astype(float)
+        d["L"] = d["L"].astype(float)
+
+        Ls = sorted(d["L"].unique())
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        for l in Ls:
+            sub = d[d["L"] == l].sort_values("S")
+            ax.errorbar(
+                sub["S"].values,
+                sub["mean_value"].values,
+                yerr=sub["std_value"].values,
+                marker="o",
+                linewidth=1.4,
+                capsize=2.8,
+                label=f"L={l:g}",
+            )
+
+        ax.set_title(title)
+        ax.set_xlabel("S")
+        ax.set_ylabel("Mean #detected genes / cell (mean ± std across crops)")
+        ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.6)
+        ax.legend(title="L", bbox_to_anchor=(1.02, 1), loc="upper left")
+
+        fig.tight_layout()
+
+        if out_svg is not None:
+            fig.savefig(out_svg)
+            print("[save] wrote", out_svg)
+
+        plt.show()
+
+    def run_detected_genes_shared_analysis(
+        self,
+        success_df,
+        out_dir,
+        cell_col="assigned_cell_id",
+        summary_csv_name="gene_counts_shared_LS_summary.csv",
+        per_run_csv_name="gene_counts_per_run_summary.csv",
+        out_svg_name="lines_gene_across_S_by_L.svg",
+        font_candidates=None
+    ):
+        """
+        Full pipeline:
+          1) collect shared reconstructed cell IDs per crop
+          2) summarize mean detected genes per reconstructed cell on shared cells
+          3) save CSVs
+          4) plot line plot across S by L
+
+        Returns
+        -------
+        dict with:
+            - shared_ids_per_crop
+            - df_summary
+            - df_per_run
+            - summary_csv
+            - per_run_csv
+            - out_svg
+        """
+        os.makedirs(out_dir, exist_ok=True)
+        warnings.filterwarnings("ignore")
+
+        self._setup_editable_vector_fonts(font_candidates=font_candidates)
+
+        shared_ids_per_crop = self.collect_shared_cell_ids_per_crop_from_success_df(
+            success_df=success_df,
+            cell_col=cell_col
+        )
+
+        df_summary, df_per_run = self.summarize_detected_genes_shared_over_success_df(
+            success_df=success_df,
+            shared_ids_per_crop=shared_ids_per_crop,
+            cell_col=cell_col
+        )
+
+        summary_csv = os.path.join(out_dir, summary_csv_name)
+        per_run_csv = os.path.join(out_dir, per_run_csv_name)
+        out_svg = os.path.join(out_dir, out_svg_name)
+
+        df_summary.to_csv(summary_csv, index=False)
+        df_per_run.to_csv(per_run_csv, index=False)
+
+        print("[save] wrote", summary_csv)
+        print("[save] wrote", per_run_csv)
+
+        self.plot_detected_genes_across_S_by_L(
+            df_summary=df_summary,
+            out_svg=out_svg
+        )
+
+        return {
+            "shared_ids_per_crop": shared_ids_per_crop,
+            "df_summary": df_summary,
+            "df_per_run": df_per_run,
+            "summary_csv": summary_csv,
+            "per_run_csv": per_run_csv,
+            "out_svg": out_svg,
+        }
+        
+        
+    def _find_celltype_column(self, adata, preferred=None):
+        """
+        Find a usable cell type column in adata.obs.
+        """
+        if preferred is not None:
+            if preferred not in adata.obs.columns:
+                raise ValueError(f"Requested cell type column not found: {preferred}")
+            return preferred
+
+        candidates = [
+            "celltypist_majority_voting",
+            "celltypist_predicted_labels",
+            "celltypist_over_clustering",
+            "leiden_ct",
+        ]
+
+        for c in candidates:
+            if c in adata.obs.columns:
+                return c
+
+        # fallback: first column starting with celltypist_
+        for c in adata.obs.columns:
+            if str(c).startswith("celltypist_"):
+                return c
+
+        raise ValueError("No cell type column found in adata.obs")
+    
+    
+    def get_celltype_per_reconstructed_cell(
+        self,
+        adata,
+        cell_col="assigned_cell_id",
+        celltype_col=None,
+        exclude_unassigned=True
+    ):
+        """
+        Collapse spot-level annotations into one cell type per reconstructed cell.
+
+        Returns
+        -------
+        DataFrame with columns:
+            - cell_id
+            - cell_type
+            - n_spots
+        """
+        if cell_col not in adata.obs.columns:
+            raise ValueError(f"Missing '{cell_col}' in adata.obs")
+
+        celltype_col = self._find_celltype_column(adata, preferred=celltype_col)
+
+        df = adata.obs[[cell_col, celltype_col]].copy()
+        df[cell_col] = self._clean_cell_ids(df[cell_col])
+
+        if exclude_unassigned:
+            df = df[df[cell_col].notna()].copy()
+
+        # clean cell type values
+        df[celltype_col] = pd.Series(df[celltype_col]).astype("string").str.strip()
+        bad_ct = {"nan", "None", "none", "undefined", ""}
+        df.loc[df[celltype_col].isin(bad_ct), celltype_col] = pd.NA
+
+        records = []
+
+        for cell_id, sub in df.groupby(cell_col):
+            ct_series = sub[celltype_col].dropna().astype(str)
+
+            if len(ct_series) == 0:
+                cell_type = "undefined"
+            else:
+                # most frequent label among spots assigned to that cell
+                cell_type = ct_series.value_counts().idxmax()
+
+            records.append({
+                "cell_id": str(cell_id),
+                "cell_type": str(cell_type),
+                "n_spots": int(sub.shape[0]),
+            })
+
+        out = pd.DataFrame(records)
+        if not out.empty:
+            out = out.sort_values(["cell_type", "n_spots"], ascending=[True, False]).reset_index(drop=True)
+
+        return out
+    
+    
+    def get_celltype_counts_from_h5ad(
+        self,
+        h5ad_path,
+        cell_col="assigned_cell_id",
+        celltype_col=None,
+        exclude_unassigned=True
+    ):
+        """
+        Read one saved run h5ad and return cell type counts.
+        """
+        if not os.path.exists(h5ad_path):
+            raise FileNotFoundError(f"h5ad not found: {h5ad_path}")
+
+        adata = sc.read_h5ad(h5ad_path)
+
+        cell_df = self.get_celltype_per_reconstructed_cell(
+            adata=adata,
+            cell_col=cell_col,
+            celltype_col=celltype_col,
+            exclude_unassigned=exclude_unassigned
+        )
+
+        if cell_df.empty:
+            return {}
+
+        counts = cell_df["cell_type"].value_counts().to_dict()
+        return counts
+    
+    def summarize_celltype_counts_for_fixed_S(
+        self,
+        counts_dict,
+        fixed_S
+    ):
+        """
+        Prepare dataframe for plotting cell type counts vs L at fixed S.
+        """
+        rows = []
+        all_ct = set()
+
+        for (L, S), counts in counts_dict.items():
+            if float(S) != float(fixed_S):
+                continue
+            all_ct.update(counts.keys())
+
+        all_ct = sorted(all_ct)
+
+        L_values = sorted({float(L) for (L, S) in counts_dict.keys() if float(S) == float(fixed_S)})
+
+        for ct in all_ct:
+            for L in L_values:
+                count = counts_dict.get((L, float(fixed_S)), {}).get(ct, 0)
+                rows.append({
+                    "cell_type": ct,
+                    "L": float(L),
+                    "S": float(fixed_S),
+                    "count": int(count),
+                })
+
+        return pd.DataFrame(rows), all_ct, L_values
+
+    def summarize_celltype_counts_for_fixed_L(
+        self,
+        counts_dict,
+        fixed_L
+    ):
+        """
+        Prepare dataframe for plotting cell type counts vs S at fixed L.
+        """
+        rows = []
+        all_ct = set()
+
+        for (L, S), counts in counts_dict.items():
+            if float(L) != float(fixed_L):
+                continue
+            all_ct.update(counts.keys())
+
+        all_ct = sorted(all_ct)
+
+        S_values = sorted({float(S) for (L, S) in counts_dict.keys() if float(L) == float(fixed_L)})
+
+        for ct in all_ct:
+            for S in S_values:
+                count = counts_dict.get((float(fixed_L), S), {}).get(ct, 0)
+                rows.append({
+                    "cell_type": ct,
+                    "L": float(fixed_L),
+                    "S": float(S),
+                    "count": int(count),
+                })
+
+        return pd.DataFrame(rows), all_ct, S_values
+    
+    
+    def _make_celltype_color_map(self, all_ct):
+        """
+        Make a stable color map for cell types.
+        """
+        all_ct = sorted(all_ct)
+
+        if len(all_ct) <= 20:
+            cmap = plt.cm.tab20
+        elif len(all_ct) <= 40:
+            cmap = plt.cm.gist_ncar
+        else:
+            cmap = plt.cm.turbo
+
+        colors = cmap(np.linspace(0, 1, len(all_ct)))
+        return dict(zip(all_ct, colors))
+    
+    def plot_celltype_counts_vs_L(
+        self,
+        df_plot,
+        all_ct,
+        L_values,
+        fixed_S,
+        out_svg=None,
+        title=None
+    ):
+        """
+        Plot cell type counts vs L at fixed S.
+        """
+        if df_plot.empty:
+            print("[plot] Empty dataframe, skipping.")
+            return
+
+        color_map = self._make_celltype_color_map(all_ct)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        for ct in all_ct:
+            sub = df_plot[df_plot["cell_type"] == ct].sort_values("L")
+            counts = sub["count"].values
+            if len(counts) == 0 or np.max(counts) == 0:
+                continue
+
+            ax.plot(
+                sub["L"].values,
+                counts,
+                marker="o",
+                label=ct,
+                color=color_map[ct],
+                linewidth=2
+            )
+
+        ax.set_xlabel("L", fontsize=12)
+        ax.set_ylabel("Number of Cells", fontsize=12)
+
+        if title is None:
+            title = f"Cell Type Counts vs L (S={fixed_S})"
+        ax.set_title(title, fontsize=14)
+
+        ax.set_xticks(L_values)
+        ax.legend(fontsize=8, bbox_to_anchor=(1.02, 1), loc="upper left", title="cell type")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        if out_svg is not None:
+            fig.savefig(out_svg)
+            print("[save] wrote", out_svg)
+
+        plt.show()
+        
+        
+    def plot_celltype_counts_vs_S(
+        self,
+        df_plot,
+        all_ct,
+        S_values,
+        fixed_L,
+        out_svg=None,
+        title=None
+    ):
+        """
+        Plot cell type counts vs S at fixed L.
+        """
+        if df_plot.empty:
+            print("[plot] Empty dataframe, skipping.")
+            return
+
+        color_map = self._make_celltype_color_map(all_ct)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        for ct in all_ct:
+            sub = df_plot[df_plot["cell_type"] == ct].sort_values("S")
+            counts = sub["count"].values
+            if len(counts) == 0 or np.max(counts) == 0:
+                continue
+
+            ax.plot(
+                sub["S"].values,
+                counts,
+                marker="o",
+                label=ct,
+                color=color_map[ct],
+                linewidth=2
+            )
+
+        ax.set_xlabel("S", fontsize=12)
+        ax.set_ylabel("Number of Cells", fontsize=12)
+
+        if title is None:
+            title = f"Cell Type Counts vs S (L={fixed_L})"
+        ax.set_title(title, fontsize=14)
+
+        ax.set_xticks(S_values)
+        ax.legend(fontsize=8, bbox_to_anchor=(1.02, 1), loc="upper left", title="cell type")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        if out_svg is not None:
+            fig.savefig(out_svg)
+            print("[save] wrote", out_svg)
+
+        plt.show()
+        
+    def run_celltype_count_lineplots_from_results(
+        self,
+        results_path,
+        out_dir,
+        summary_csv_name="run_summary.csv",
+        crop_id=1,
+        fixed_S=5,
+        fixed_L=0.05,
+        cell_col="assigned_cell_id",
+        celltype_col=None,
+        exclude_unassigned=True,
+        save_tables=True
+    ):
+        """
+        Full pipeline:
+          1) load success runs from summary CSV
+          2) collect cell type counts from saved h5ad files for one crop
+          3) plot:
+                - counts vs L at fixed S
+                - counts vs S at fixed L
+
+        Returns
+        -------
+        dict with summary tables and plot paths
+        """
+        os.makedirs(out_dir, exist_ok=True)
+        self._setup_editable_vector_fonts(font_candidates=["Helvetica"])
+
+        counts_dict = self.collect_celltype_counts_from_results(
+            results_path=results_path,
+            summary_csv_name=summary_csv_name,
+            crop_id=crop_id,
+            cell_col=cell_col,
+            celltype_col=celltype_col,
+            exclude_unassigned=exclude_unassigned
+        )
+
+        df_L, all_ct_L, L_values = self.summarize_celltype_counts_for_fixed_S(
+            counts_dict=counts_dict,
+            fixed_S=fixed_S
+        )
+
+        df_S, all_ct_S, S_values = self.summarize_celltype_counts_for_fixed_L(
+            counts_dict=counts_dict,
+            fixed_L=fixed_L
+        )
+
+        svg_L = os.path.join(out_dir, f"celltype_counts_vs_L_S{fixed_S}_crop{crop_id}.svg")
+        svg_S = os.path.join(out_dir, f"celltype_counts_vs_S_L{fixed_L}_crop{crop_id}.svg")
+
+        self.plot_celltype_counts_vs_L(
+            df_plot=df_L,
+            all_ct=all_ct_L,
+            L_values=L_values,
+            fixed_S=fixed_S,
+            out_svg=svg_L,
+            title=f"Cell Type Counts vs L (S={fixed_S}, crop{crop_id})"
+        )
+
+        self.plot_celltype_counts_vs_S(
+            df_plot=df_S,
+            all_ct=all_ct_S,
+            S_values=S_values,
+            fixed_L=fixed_L,
+            out_svg=svg_S,
+            title=f"Cell Type Counts vs S (L={fixed_L}, crop{crop_id})"
+        )
+
+        csv_L = os.path.join(out_dir, f"celltype_counts_vs_L_S{fixed_S}_crop{crop_id}.csv")
+        csv_S = os.path.join(out_dir, f"celltype_counts_vs_S_L{fixed_L}_crop{crop_id}.csv")
+
+        if save_tables:
+            df_L.to_csv(csv_L, index=False)
+            df_S.to_csv(csv_S, index=False)
+            print("[save] wrote", csv_L)
+            print("[save] wrote", csv_S)
+
+        return {
+            "counts_dict": counts_dict,
+            "df_vs_L": df_L,
+            "df_vs_S": df_S,
+            "svg_vs_L": svg_L,
+            "svg_vs_S": svg_S,
+            "csv_vs_L": csv_L,
+            "csv_vs_S": csv_S,
+        }
+        
+
+    def _find_reference_celltype_column(self, adata, preferred=None):
+        """
+        Find a usable cell type column in scRNA reference adata.obs.
+        """
+        if preferred is not None:
+            if preferred not in adata.obs.columns:
+                raise ValueError(f"Requested reference cell type column not found: {preferred}")
+            return preferred
+
+        candidates = [
+            "cell_type",
+            "celltype",
+            "cell_type_level1",
+            "cell_type_level2",
+            "celltype_major",
+            "celltype_minor",
+            "annotation",
+            "annot",
+            "label",
+            "labels",
+            "celltypist_predicted_labels",
+            "leiden_ct",
+        ]
+
+        for c in candidates:
+            if c in adata.obs.columns:
+                return c
+
+        raise ValueError("No usable reference cell type column found in sc_ref adata.obs")
+
+
+    def get_single_cell_reference_type_counts(
+        self,
+        ref_path=None,
+        celltype_col=None
+    ):
+        """
+        Read the single-cell reference h5ad and return cell type counts.
+
+        Returns
+        -------
+        counts : dict
+            {cell_type: count}
+        """
+        if ref_path is None:
+            ref_path = self.sc_ref
+
+        if ref_path is None or not os.path.exists(ref_path):
+            raise FileNotFoundError(f"Single-cell reference not found: {ref_path}")
+
+        adata = sc.read_h5ad(ref_path)
+        ct_col = self._find_reference_celltype_column(adata, preferred=celltype_col)
+
+        s = pd.Series(adata.obs[ct_col]).astype("string").str.strip()
+        bad = {"nan", "None", "none", "undefined", ""}
+        s = s[~s.isin(bad)].dropna()
+
+        return s.value_counts().to_dict()
+
+
+    def build_single_cell_reference_count_tables(
+        self,
+        L_values,
+        S_values,
+        fixed_S=5,
+        fixed_L=0.05,
+        ref_path=None,
+        celltype_col=None
+    ):
+        """
+        Build plotting tables for single-cell reference cell type counts.
+
+        Since the reference itself does not depend on L or S, the same counts are
+        repeated across the requested x-values so you can compare against your STCS plots.
+        """
+        counts = self.get_single_cell_reference_type_counts(
+            ref_path=ref_path,
+            celltype_col=celltype_col
+        )
+
+        all_ct = sorted(counts.keys())
+
+        rows_L = []
+        for ct in all_ct:
+            for L in sorted([float(x) for x in L_values]):
+                rows_L.append({
+                    "cell_type": ct,
+                    "L": float(L),
+                    "S": float(fixed_S),
+                    "count": int(counts.get(ct, 0)),
+                })
+
+        rows_S = []
+        for ct in all_ct:
+            for S in sorted([float(x) for x in S_values]):
+                rows_S.append({
+                    "cell_type": ct,
+                    "L": float(fixed_L),
+                    "S": float(S),
+                    "count": int(counts.get(ct, 0)),
+                })
+
+        df_L = pd.DataFrame(rows_L)
+        df_S = pd.DataFrame(rows_S)
+
+        return df_L, df_S, all_ct
+
+
+    def run_single_cell_reference_count_lineplots(
+        self,
+        out_dir,
+        L_values,
+        S_values,
+        fixed_S=5,
+        fixed_L=0.05,
+        ref_path=None,
+        celltype_col=None,
+        save_tables=True
+    ):
+        """
+        Plot single-cell reference cell type counts in the same line-plot format:
+          - counts vs L at fixed S
+          - counts vs S at fixed L
+
+        This is useful as a reference/baseline figure alongside STCS results.
+        """
+        os.makedirs(out_dir, exist_ok=True)
+        self._setup_editable_vector_fonts(font_candidates=["Helvetica"])
+
+        df_L, df_S, all_ct = self.build_single_cell_reference_count_tables(
+            L_values=L_values,
+            S_values=S_values,
+            fixed_S=fixed_S,
+            fixed_L=fixed_L,
+            ref_path=ref_path,
+            celltype_col=celltype_col
+        )
+
+        svg_L = os.path.join(out_dir, f"singlecell_celltype_counts_vs_L_S{fixed_S}.svg")
+        svg_S = os.path.join(out_dir, f"singlecell_celltype_counts_vs_S_L{fixed_L}.svg")
+        csv_L = os.path.join(out_dir, f"singlecell_celltype_counts_vs_L_S{fixed_S}.csv")
+        csv_S = os.path.join(out_dir, f"singlecell_celltype_counts_vs_S_L{fixed_L}.csv")
+
+        self.plot_celltype_counts_vs_L(
+            df_plot=df_L,
+            all_ct=all_ct,
+            L_values=sorted([float(x) for x in L_values]),
+            fixed_S=fixed_S,
+            out_svg=svg_L,
+            title=f"Single-cell Reference Cell Type Counts vs L (S={fixed_S})"
+        )
+
+        self.plot_celltype_counts_vs_S(
+            df_plot=df_S,
+            all_ct=all_ct,
+            S_values=sorted([float(x) for x in S_values]),
+            fixed_L=fixed_L,
+            out_svg=svg_S,
+            title=f"Single-cell Reference Cell Type Counts vs S (L={fixed_L})"
+        )
+
+        if save_tables:
+            df_L.to_csv(csv_L, index=False)
+            df_S.to_csv(csv_S, index=False)
+            print("[save] wrote", csv_L)
+            print("[save] wrote", csv_S)
+
+        return {
+            "df_vs_L": df_L,
+            "df_vs_S": df_S,
+            "svg_vs_L": svg_L,
+            "svg_vs_S": svg_S,
+            "csv_vs_L": csv_L,
+            "csv_vs_S": csv_S,
+        }
+        
+    def get_single_cell_reference_detected_genes(
+        self,
+        ref_path=None
+    ):
+        """
+        Read the single-cell reference h5ad and return per-cell detected gene counts.
+
+        Returns
+        -------
+        DataFrame with columns:
+            - cell_id
+            - n_detected_genes
+        """
+        if ref_path is None:
+            ref_path = self.sc_ref
+
+        if ref_path is None or not os.path.exists(ref_path):
+            raise FileNotFoundError(f"Single-cell reference not found: {ref_path}")
+
+        adata = sc.read_h5ad(ref_path)
+
+        if "n_genes_by_counts" not in adata.obs.columns:
+            sc.pp.calculate_qc_metrics(adata, inplace=True)
+
+        cell_ids = pd.Series(adata.obs_names).astype(str)
+
+        out = pd.DataFrame({
+            "cell_id": cell_ids.values,
+            "n_detected_genes": pd.to_numeric(adata.obs["n_genes_by_counts"], errors="coerce").values
+        }).dropna(subset=["n_detected_genes"])
+
+        return out.reset_index(drop=True)
+
+
+    def build_single_cell_reference_detected_gene_tables(
+        self,
+        L_values,
+        S_values,
+        fixed_S=5,
+        fixed_L=0.05,
+        ref_path=None
+    ):
+        """
+        Build plotting tables for single-cell reference detected genes.
+
+        Since the reference does not depend on L or S, the same mean/std are
+        repeated across the requested x-values.
+        """
+        df_ref = self.get_single_cell_reference_detected_genes(ref_path=ref_path)
+
+        if df_ref.empty:
+            raise ValueError("Single-cell reference detected-gene table is empty.")
+
+        mean_val = float(df_ref["n_detected_genes"].mean())
+        std_val = float(df_ref["n_detected_genes"].std(ddof=0))
+        n_cells = int(df_ref.shape[0])
+
+        rows_L = []
+        for L in sorted([float(x) for x in L_values]):
+            rows_L.append({
+                "L": float(L),
+                "S": float(fixed_S),
+                "mean_value": mean_val,
+                "std_value": std_val,
+                "n_cells": n_cells,
+            })
+
+        rows_S = []
+        for S in sorted([float(x) for x in S_values]):
+            rows_S.append({
+                "L": float(fixed_L),
+                "S": float(S),
+                "mean_value": mean_val,
+                "std_value": std_val,
+                "n_cells": n_cells,
+            })
+
+        df_L = pd.DataFrame(rows_L)
+        df_S = pd.DataFrame(rows_S)
+
+        return df_L, df_S, df_ref
+
+
+    def plot_single_series_detected_genes_vs_L(
+        self,
+        df_plot,
+        fixed_S,
+        out_svg=None,
+        title=None
+    ):
+        """
+        Plot single-cell reference mean detected genes vs L at fixed S.
+        """
+        if df_plot.empty:
+            print("[plot] Empty dataframe, skipping.")
+            return
+
+        sub = df_plot.sort_values("L")
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.errorbar(
+            sub["L"].values,
+            sub["mean_value"].values,
+            yerr=sub["std_value"].values,
+            marker="o",
+            linewidth=1.8,
+            capsize=3
+        )
+
+        ax.set_xlabel("L", fontsize=12)
+        ax.set_ylabel("Mean detected genes / single cell", fontsize=12)
+
+        if title is None:
+            title = f"Single-cell Reference Detected Genes vs L (S={fixed_S})"
+        ax.set_title(title, fontsize=14)
+
+        ax.set_xticks(sub["L"].values)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        if out_svg is not None:
+            fig.savefig(out_svg)
+            print("[save] wrote", out_svg)
+
+        plt.show()
+
+
+    def plot_single_series_detected_genes_vs_S(
+        self,
+        df_plot,
+        fixed_L,
+        out_svg=None,
+        title=None
+    ):
+        """
+        Plot single-cell reference mean detected genes vs S at fixed L.
+        """
+        if df_plot.empty:
+            print("[plot] Empty dataframe, skipping.")
+            return
+
+        sub = df_plot.sort_values("S")
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.errorbar(
+            sub["S"].values,
+            sub["mean_value"].values,
+            yerr=sub["std_value"].values,
+            marker="o",
+            linewidth=1.8,
+            capsize=3
+        )
+
+        ax.set_xlabel("S", fontsize=12)
+        ax.set_ylabel("Mean detected genes / single cell", fontsize=12)
+
+        if title is None:
+            title = f"Single-cell Reference Detected Genes vs S (L={fixed_L})"
+        ax.set_title(title, fontsize=14)
+
+        ax.set_xticks(sub["S"].values)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        if out_svg is not None:
+            fig.savefig(out_svg)
+            print("[save] wrote", out_svg)
+
+        plt.show()
+
+
+    def run_single_cell_reference_detected_gene_lineplots(
+        self,
+        out_dir,
+        L_values,
+        S_values,
+        fixed_S=5,
+        fixed_L=0.05,
+        ref_path=None,
+        save_tables=True
+    ):
+        """
+        Full pipeline for single-cell reference detected-gene baseline plots:
+          - mean detected genes vs L at fixed S
+          - mean detected genes vs S at fixed L
+        """
+        os.makedirs(out_dir, exist_ok=True)
+        self._setup_editable_vector_fonts(font_candidates=["Helvetica"])
+
+        df_L, df_S, df_ref = self.build_single_cell_reference_detected_gene_tables(
+            L_values=L_values,
+            S_values=S_values,
+            fixed_S=fixed_S,
+            fixed_L=fixed_L,
+            ref_path=ref_path
+        )
+
+        svg_L = os.path.join(out_dir, f"singlecell_detected_genes_vs_L_S{fixed_S}.svg")
+        svg_S = os.path.join(out_dir, f"singlecell_detected_genes_vs_S_L{fixed_L}.svg")
+        csv_L = os.path.join(out_dir, f"singlecell_detected_genes_vs_L_S{fixed_S}.csv")
+        csv_S = os.path.join(out_dir, f"singlecell_detected_genes_vs_S_L{fixed_L}.csv")
+        csv_ref = os.path.join(out_dir, "singlecell_detected_genes_per_cell.csv")
+
+        self.plot_single_series_detected_genes_vs_L(
+            df_plot=df_L,
+            fixed_S=fixed_S,
+            out_svg=svg_L
+        )
+
+        self.plot_single_series_detected_genes_vs_S(
+            df_plot=df_S,
+            fixed_L=fixed_L,
+            out_svg=svg_S
+        )
+
+        if save_tables:
+            df_L.to_csv(csv_L, index=False)
+            df_S.to_csv(csv_S, index=False)
+            df_ref.to_csv(csv_ref, index=False)
+            print("[save] wrote", csv_L)
+            print("[save] wrote", csv_S)
+            print("[save] wrote", csv_ref)
+
+        return {
+            "df_vs_L": df_L,
+            "df_vs_S": df_S,
+            "df_ref": df_ref,
+            "svg_vs_L": svg_L,
+            "svg_vs_S": svg_S,
+            "csv_vs_L": csv_L,
+            "csv_vs_S": csv_S,
+            "csv_ref": csv_ref,
+        }
+        
+    def load_success_df_from_summary_csv(
+        self,
+        results_path,
+        summary_csv_name="run_summary.csv"
+    ):
+        """
+        Load run summary CSV and keep only successful runs.
+        """
+        summary_csv = os.path.join(results_path, summary_csv_name)
+        if not os.path.exists(summary_csv):
+            raise FileNotFoundError(f"Summary CSV not found: {summary_csv}")
+
+        summary_df = pd.read_csv(summary_csv)
+        if "status" not in summary_df.columns:
+            raise ValueError("summary CSV must contain a 'status' column")
+
+        success_df = summary_df[summary_df["status"] == "success"].copy()
+        if success_df.empty:
+            print("[Warning]: No successful runs found in summary CSV.")
+
+        return success_df
+
+
+    def collect_celltype_counts_from_results(
+        self,
+        results_path,
+        summary_csv_name="run_summary.csv",
+        crop_id=1,
+        cell_col="assigned_cell_id",
+        celltype_col=None,
+        exclude_unassigned=True
+    ):
+        """
+        Load successful runs from summary CSV, restricted to one crop_id,
+        and collect reconstructed-cell cell type counts for each (L, S).
+
+        Returns
+        -------
+        dict keyed by (L, S)
+        """
+        success_df = self.load_success_df_from_summary_csv(
+            results_path=results_path,
+            summary_csv_name=summary_csv_name
+        )
+
+        required = {"crop_id", "lambda", "search_radius", "output_h5ad"}
+        missing = required - set(success_df.columns)
+        if missing:
+            raise ValueError(f"summary CSV missing required columns: {missing}")
+
+        sub = success_df[success_df["crop_id"] == crop_id].copy()
+        if sub.empty:
+            print(f"[Warning]: No successful runs found for crop_id={crop_id}")
+            return {}
+
+        out = {}
+
+        for _, row in sub.iterrows():
+            L = float(row["lambda"])
+            S = float(row["search_radius"])
+            h5 = row["output_h5ad"]
+
+            try:
+                counts = self.get_celltype_counts_from_h5ad(
+                    h5ad_path=h5,
+                    cell_col=cell_col,
+                    celltype_col=celltype_col,
+                    exclude_unassigned=exclude_unassigned
+                )
+                out[(L, S)] = counts
+            except Exception as e:
+                print(f"[Warning]: Failed for {h5}: {e}")
+                out[(L, S)] = {}
+
+        return out
+    
+    
+    def annotate_saved_runs_with_celltypist(
+        self,
+        results_path,
+        annotated_dir_name="annotated_runs",
+        cell_col="assigned_cell_id",
+        model_path=None
+    ):
+        """
+        Run CellTypist annotation on already-saved sweep .h5ad files.
+
+        Parameters
+        ----------
+        results_path : str
+            Folder containing sweep .h5ad outputs
+        annotated_dir_name : str
+            Output folder for annotated runs
+        cell_col : str
+            Column containing reconstructed cell IDs
+        model_path : str
+            CellTypist model path (defaults to self.model_path)
+        """
+
+        import glob
+        import scanpy as sc
+        import pandas as pd
+        import celltypist
+        import scipy.sparse as sp
+
+        if model_path is None:
+            model_path = self.model_path
+
+        if model_path is None or not os.path.exists(model_path):
+            raise ValueError("Valid CellTypist model_path is required")
+
+        annotated_dir = os.path.join(results_path, annotated_dir_name)
+        os.makedirs(annotated_dir, exist_ok=True)
+
+        files = sorted(glob.glob(os.path.join(results_path, "*.h5ad")))
+
+        print(f"[Annotate]: Found {len(files)} runs")
+
+        for f in files:
+
+            print(f"[Annotate]: {os.path.basename(f)}")
+
+            try:
+
+                adata = sc.read_h5ad(f)
+
+                if cell_col not in adata.obs.columns:
+                    print("[Skip]: no assigned cells")
+                    continue
+
+                # remove unassigned spots
+                cell_ids = pd.Series(adata.obs[cell_col]).astype("string")
+                mask = cell_ids.notna()
+                ad = adata[mask].copy()
+
+                if ad.n_obs == 0:
+                    print("[Skip]: no valid spots")
+                    continue
+
+                # build pseudobulk
+                groups = cell_ids[mask].astype(str).values
+                unique_cells, group_idx = np.unique(groups, return_inverse=True)
+
+                X = ad.X
+                if not sp.issparse(X):
+                    X = sp.csr_matrix(X)
+
+                M = sp.csr_matrix(
+                    (np.ones(len(groups)), (group_idx, np.arange(len(groups)))),
+                    shape=(len(unique_cells), len(groups))
+                )
+
+                X_sum = (M @ X).tocsr()
+
+                pseudo = sc.AnnData(
+                    X=X_sum,
+                    obs=pd.DataFrame(index=unique_cells),
+                    var=ad.var.copy()
+                )
+
+                # CellTypist preprocessing
+                sc.pp.normalize_total(pseudo, target_sum=1e4)
+                sc.pp.log1p(pseudo)
+
+                preds = celltypist.annotate(
+                    pseudo,
+                    model=model_path,
+                    majority_voting=True
+                )
+
+                pred_adata = preds.to_adata()
+
+                ct_labels = pred_adata.obs["majority_voting"].astype(str)
+
+                # map back to spots
+                adata.obs["celltypist_predicted_labels"] = adata.obs[cell_col].map(ct_labels)
+
+                out_file = os.path.join(
+                    annotated_dir,
+                    os.path.basename(f)
+                )
+
+                adata.write_h5ad(out_file)
+
+                print("[Saved]", out_file)
+
+            except Exception as e:
+                print("[Error]:", e)
+
+        print("[Done] Annotation complete")
+
+        return annotated_dir
