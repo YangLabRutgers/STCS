@@ -108,7 +108,7 @@ https://en.stomics.tech/col1241/index.html
 
 If you use STCS in your research, please cite:
 
-Wu LC*, Hu X*, Zhan F, Sun C, Gonzales J, Ofer R, Tran T,
+Chen Wu L*, Hu X*, Zhan F, Sun C, Gonzales J, Ofer R, Tran T,
 Verzi MP, Liu L†, Yang J†
 
 STCS: A Platform-Agnostic Framework for Cell-Level Reconstruction
