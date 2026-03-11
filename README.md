@@ -45,6 +45,7 @@ The STCS pipeline consists of the following steps:
 For Visium HD datasets, we recommend performing parameter tuning before running the full STCS pipeline for new tissue slides.
 
 **Step 1 — Parameter tuning**
+
 Run: **Parameter_Tuning.ipynb**
 
 This notebook searches combinations of:
