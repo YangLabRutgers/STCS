@@ -90,8 +90,7 @@ stops that. Both are computed before quality-control filtering.
 *Reading the heatmaps.* The notebook prints three, in order: connectivity, transcript
 deviation, then the combined score. In each, the single best cell is outlined **solid
 yellow**, and any cell that is identical to it once rounded to two decimals is outlined
-**dashed white**. Treat dashed cells as ties rather than runners-up; where several tie,
-prefer the smaller S, which keeps cells compact.
+**dashed white**.
 
 Selected settings are slide-specific and also depend on bin size, so re-run this step for
 a new tissue, a new platform, or a different binning.
