@@ -64,7 +64,7 @@ windows are ranked by density on a grid, filtered to those lying almost entirely
 tissue, and taken greedily so that no two overlap. Density is counted from nuclei when
 segmentation has already been run, and from transcripts otherwise.
 
-*Grid.* The notebook then sweeps combinations of
+The notebook then sweeps combinations of
 
 - search radius **S**, in bins
 - spatial weight **λ**
