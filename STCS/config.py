@@ -19,11 +19,13 @@ n_top_genes = 5000
 batch_size = 50000
 
 #TODO: input your L and S based on the parameter tuning. 
-L = 0.5 # Lambda
-search_radius = 5  # radius for search
+L = 0.5          # Lambda
+search_radius = 2  # search radius in bins; 2 reproduces newmethod_S2_L0.5
 
 # for pesudobulk
-assignment_mode = 'mean'
+assignment_mode = 'sum'   # newMethod aggregates a reconstructed cell's bins by SUM
+                          # (raw counts added up); 'mean' would divide out cell depth
+                          # before CellTypist and is NOT what newMethod does
 empty = False
 
 # for CellTypist

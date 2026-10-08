@@ -22,15 +22,14 @@ from pathlib import Path
 from h5py import File
 from imageio.v2 import imread
 
-from stardist.data import test_image_nuclei_2d
-from stardist.plot import render_label
-from csbdeep.utils import normalize
 import matplotlib.pyplot as plt
-from stardist.models import StarDist2D
+from matplotlib.patches import Rectangle
 import scipy
 
 from scipy.sparse import issparse
 import anndata as ad
+import geopandas as gpd
+from shapely.geometry import MultiPoint
 from anndata import AnnData
 
 import shutil
@@ -51,6 +50,33 @@ from config import (
     target_sum, n_top_genes,L, batch_size, search_radius as default_search_radius, assignment_mode, empty,
      stardist_mode, celltypist_target_sum
 )
+
+
+# ---- parallel sweep worker -------------------------------------------------------
+# Populated in the parent before forking; children inherit it copy-on-write, so the
+# loaded dataset is shared rather than copied or pickled.
+_SWEEP_CTX = {}
+
+
+def _sweep_worker(task):
+    """Run one (crop, S, lambda) in a forked child. Returns the result dict."""
+    crop_idx, rect, s, lam = task
+    stcs = _SWEEP_CTX["self"]
+    kw = _SWEEP_CTX["kw"]
+    try:
+        return stcs.run_single_crop_parameter_set(
+            rect=rect, crop_id=crop_idx, search_radius=s, lam=lam, **kw
+        )
+    except Exception as e:
+        # One bad combination must not take the whole sweep down with it.
+        x, y, w, h = rect
+        return {
+            "run_name": "crop%02d_x%d_y%d_w%d_h%d_S%s_L%s" % (crop_idx, x, y, w, h, s, lam),
+            "crop_id": crop_idx, "x": x, "y": y, "w": w, "h": h,
+            "search_radius": s, "lambda": lam,
+            "output_h5ad": None, "status": "failed: %r" % (e,),
+        }
+
 
 class STCS:
     """
@@ -551,6 +577,9 @@ class STCS:
         dim = (np.array(img.shape[:2])*scalef).astype(int)[::-1]
         scaled_img = cv2.resize(img, dim, interpolation=cv2.INTER_AREA)
 """
+        from stardist.models import StarDist2D   # imported here: pulls in TensorFlow
+        from csbdeep.utils import normalize
+
         model = StarDist2D.from_pretrained(stardist_model)
         scaled_img = normalize(img)
         labels, _ = model.predict_instances(scaled_img,prob_thresh=prob_thresh,n_tiles=n_tiles)
@@ -590,6 +619,68 @@ class STCS:
 
     # ========== PSEUDOBULK CREATION ==========
     
+    def attach_precomputed_labels(
+        self,
+        path,
+        labels_h5ad,
+        labels_key="labels_he",
+        verbose=True,
+        write=True,
+    ):
+        """Reuse nucleus labels computed elsewhere instead of running StarDist.
+
+        This is the equivalent of newMethod's `skipb2c=True`: a StarDist (or Bin2Cell)
+        run already exists for the whole slide, so there is no reason to re-segment, and
+        on a machine without TensorFlow there is no way to. The labels are looked up by
+        barcode, so cropping is handled automatically.
+
+        Produces exactly what run_stardist_pipeline produces downstream: .obs[labels_key]
+        on self.adata and self.raw_adata, a written barcode h5ad, and _barcode_data_path.
+
+        path         : output directory, same one passed to run_stardist_pipeline
+        labels_h5ad  : an .h5ad whose .obs carries `labels_key`, indexed by barcode
+        """
+        src = sc.read_h5ad(labels_h5ad)
+        if labels_key not in src.obs.columns:
+            raise ValueError("'%s' not found in %s" % (labels_key, labels_h5ad))
+        lut = pd.Series(src.obs[labels_key].values, index=src.obs_names.astype(str))
+        del src
+
+        stardist_path = os.path.join(path, "stardist")
+        os.makedirs(stardist_path, exist_ok=True)
+
+        for target in (self.raw_adata, self.adata):
+            if target is None:
+                continue
+            idx = target.obs_names.astype(str)
+            vals = lut.reindex(idx).values
+            vals = np.where(pd.isna(vals), 0, vals)
+            target.obs[labels_key] = vals.astype(int)
+
+        n_tot = self.adata.n_obs
+        n_lab = int((self.adata.obs[labels_key] != 0).sum())
+        n_nuc = int(pd.unique(self.adata.obs.loc[self.adata.obs[labels_key] != 0, labels_key]).size)
+        if verbose:
+            print("[Log]: attached precomputed labels from %s" % labels_h5ad)
+            print("[Log]: %d/%d bins carry a nucleus label (%d nuclei)" % (n_lab, n_tot, n_nuc))
+        if n_lab == 0:
+            print("[Warning]: no bins matched a label; check that barcodes are comparable")
+
+        if not write:
+            # in-memory only: enough for crop picking, and avoids writing a multi-GB file
+            return self
+
+        # the H&E image rides in .uns and dwarfs the data; drop it before writing
+        try:
+            for _k in list((self.adata.uns.get("spatial") or {}).keys()):
+                self.adata.uns["spatial"][_k].pop("images", None)
+        except Exception:
+            pass
+        barcode_path = os.path.join(stardist_path, "stardist_barcode_outputs.h5ad")
+        self.adata.write_h5ad(barcode_path)
+        self._barcode_data_path = barcode_path
+        return self
+
     def create_pseudobulk_from_stardist(self, output_path, mode=stardist_mode, remove_empty=empty):
         """Create pseudobulk directly from stardist detection results"""
         
@@ -688,8 +779,15 @@ class STCS:
         print(f"[Log]: Creating pseudobulk based on {cell_key}")
         
         adata = adata.copy()
+        # drop missing BEFORE stringifying, then drop StarDist background (label 0);
+        # newMethod keeps only bins whose labels_he is a real nucleus
+        keep = adata.obs[cell_key].notna()
+        adata = adata[keep].copy()
         adata.obs['cell'] = adata.obs[cell_key].astype(str)
-        celldata = adata[adata.obs['cell'].notna()]
+        bad = {'nan', 'none', 'None', '0', '0.0', ''}
+        celldata = adata[~adata.obs['cell'].isin(bad)]
+        print(f"[Log]: pseudobulk over {celldata.n_obs}/{keep.shape[0]} bins "
+              f"({celldata.obs['cell'].nunique()} cells)")
         
         if not sp.isspmatrix_csr(celldata.X):
             celldata.X = celldata.X.tocsr()
@@ -883,20 +981,25 @@ class STCS:
             row, col = int(all_coords[i][0]), int(all_coords[i][1])
             candidate_cells = []
             
+            # newMethod semantics: a bin that already carries a nucleus label is
+            # ANCHORED to that nucleus and never competes with neighbours.  Only
+            # unlabelled bins search the disc.  (Previously the neighbour scan ran
+            # unconditionally, which let a nucleus bin be reassigned to a neighbour.)
             if barcode in barcode_to_own_label:
-                candidate_cells.append(barcode_to_own_label[barcode])
-            
-            # Search in circular neighborhood
-            for dr in range(-search_radius, search_radius + 1):
-                for dc in range(-search_radius, search_radius + 1):
-                    neighbor_coord = (int(row + dr), int(col + dc))
-                    
-                    # Check if within circular radius and has detected cell
-                    distance_sq = dr*dr + dc*dc
-                    if distance_sq <= search_radius*search_radius and neighbor_coord in coord_to_cell:
-                        cell_id = coord_to_cell[neighbor_coord]
-                        if cell_id not in candidate_cells:
-                            candidate_cells.append(int(cell_id))
+                barcode_candidates[barcode] = [barcode_to_own_label[barcode]]
+                continue
+
+            # Search the precomputed disc.  `offsets` was built above but the loop
+            # below used to re-scan the full square and filter inline, so the
+            # precomputation was dead code.  Iterating `offsets` directly gives the
+            # same (dr, dc) sequence as newMethod's disc_offsets(r) and is ~2x faster.
+            seen = set()
+            for dr, dc in offsets:
+                neighbor_coord = (row + dr, col + dc)
+                cell_id = coord_to_cell.get(neighbor_coord)
+                if cell_id is not None and cell_id not in seen:
+                    seen.add(cell_id)
+                    candidate_cells.append(int(cell_id))
             
             barcode_candidates[barcode] = candidate_cells
         
@@ -953,7 +1056,8 @@ class STCS:
         adata = self.adata.copy()
         adata.var_names_make_unique()
         adata = adata[:, pseudobulk_data.var_names].copy()
-        sc.pp.filter_genes(adata, min_cells=min_cells)
+        # newMethod does not filter genes again here; doing so can drop a gene and
+        # shift the PCA projection relative to the loadings
         sc.pp.normalize_total(adata, target_sum=target_sum)
         sc.pp.log1p(adata)
         self._simple_scale(adata)
@@ -1010,7 +1114,7 @@ class STCS:
         
         loadings = pseudobulk_data.varm['PCs']
         adata.raw = adata.copy()
-        sc.pp.filter_genes(adata, min_cells=min_cells)
+        # newMethod does not filter genes again here (see note in the sc-ref path)
         sc.pp.normalize_total(adata, target_sum=target_sum)
         sc.pp.log1p(adata)
         self._simple_scale(adata)
@@ -1161,8 +1265,16 @@ class STCS:
                     s_list.append(s_raw)
 
             if not t_list:
-                print("[Error]: No valid distance calculations found")
-                return {}
+                # No bin had more than one candidate, so there is nothing to score.
+                # This is the expected case at search_radius = 0, where every bin can
+                # only belong to the nucleus it already sits in. Fall through to the
+                # trivial assignment instead of returning nothing, so S=0 still gives a
+                # valid nuclei-only reconstruction rather than failing the run.
+                print("[Log]: no multi-candidate bins; assigning the single-candidate "
+                      "bins directly (expected at search_radius = 0)")
+                for bname, cand in bar.items():
+                    assignments[bname] = str(int(cand[0])) if len(cand) == 1 else None
+                return assignments
 
             t_arr = np.asarray(t_list, dtype=float)
             s_arr = np.asarray(s_list, dtype=float)
@@ -1491,6 +1603,368 @@ class STCS:
         return int(np.sum(mask))
     
     
+    def pick_dense_crops(
+        self,
+        n_crops=5,
+        target_tissue_fraction=0.10,
+        stride=100,
+        min_tissue_frac=0.90,
+        density_source="auto",
+        labels_key="labels_he",
+        crop_size=None,
+        verbose=True,
+    ):
+        """Pick non-overlapping crops over the densest tissue, with the crop SIZE derived.
+
+        Nothing is set by hand. The side length follows from how much of the tissue the
+        crops should cover in total:
+
+            SIZE = sqrt(target_tissue_fraction * A_tissue / n_crops)
+
+        rounded to a whole number of `stride` steps, where A_tissue is the in-tissue area
+        in pixels (number of bins x bin pitch^2). Windows are then ranked by density on a
+        `stride`-px grid using an integral image, and taken greedily: the densest window
+        is kept, every window overlapping it is masked out, repeat.
+
+        density_source
+            'nuclei' : rank by nucleus count; needs `labels_key` in .obs, so run StarDist
+                       on the full slide first. This is the faithful option.
+            'counts' : rank by total transcript counts per bin. Works before segmentation.
+            'auto'   : use 'nuclei' if `labels_key` is present, else 'counts'.
+
+        Returns a list of (x, y, w, h) rects, the format generate_random_crops uses.
+        """
+        adata = self.adata
+        if "spatial" not in adata.obsm:
+            raise ValueError("No spatial coordinates in adata.obsm['spatial'].")
+        xy = np.asarray(adata.obsm["spatial"], dtype=float)
+        xs, ys = xy[:, 0], xy[:, 1]
+
+        # Bin pitch in pixels, from the median nearest-neighbour distance on a sample.
+        # Taking differences of sorted unique coordinates fails whenever the bin lattice
+        # is rotated relative to the image axes, because then the x values are almost
+        # continuous and the spacing collapses to sub-pixel.
+        from scipy.spatial import cKDTree
+        n_s = min(20000, xy.shape[0])
+        samp = xy if xy.shape[0] <= n_s else xy[
+            np.random.default_rng(0).choice(xy.shape[0], n_s, replace=False)]
+        nn = cKDTree(xy).query(samp, k=2)[0][:, 1]
+        pitch = float(np.median(nn[np.isfinite(nn) & (nn > 0)])) if nn.size else 1.0
+        if not np.isfinite(pitch) or pitch <= 0:
+            pitch = 1.0
+        a_tissue = len(xs) * pitch ** 2
+
+        # derive the crop side unless one was forced
+        if crop_size is None:
+            size = int(round(np.sqrt(target_tissue_fraction * a_tissue / n_crops) / stride) * stride)
+            size = max(size, stride)
+        else:
+            size = int(crop_size)
+        achieved = n_crops * size ** 2 / a_tissue if a_tissue > 0 else float("nan")
+        if verbose:
+            print("[Log]: bin pitch ~%.3f px; in-tissue area %,.0f px^2".replace("%,", "%") % (pitch, a_tissue))
+            print("[Log]: SIZE = %d px -> %d crops cover %.2f%% of tissue" % (size, n_crops, 100 * achieved))
+
+        # what to rank by
+        src = density_source
+        if src == "auto":
+            src = "nuclei" if labels_key in adata.obs.columns else "counts"
+        if src == "nuclei":
+            if labels_key not in adata.obs.columns:
+                raise ValueError(
+                    "density_source='nuclei' needs .obs['%s']; run the StarDist pipeline "
+                    "on the full slide first, or use density_source='counts'." % labels_key)
+            lab = adata.obs[labels_key].values
+            keep = np.asarray([(v == v) and str(v) not in ("0", "0.0", "nan", "None") for v in lab])
+            df = pd.DataFrame({"lab": lab[keep], "x": xs[keep], "y": ys[keep]})
+            cent = df.groupby("lab")[["x", "y"]].mean()      # one point per nucleus
+            px, py, wts = cent["x"].values, cent["y"].values, None
+            if verbose:
+                print("[Log]: ranking by nucleus density (%d nuclei)" % len(cent))
+        else:
+            X = adata.X
+            wts = np.asarray(X.sum(axis=1)).ravel() if sp.issparse(X) else np.asarray(X).sum(axis=1)
+            px, py = xs, ys
+            if verbose:
+                print("[Log]: ranking by transcript density (%.0f counts)" % float(wts.sum()))
+
+        gx = int(np.ceil((max(xs.max(), px.max()) + stride) / stride))
+        gy = int(np.ceil((max(ys.max(), py.max()) + stride) / stride))
+        rng_ = [[0, gy * stride], [0, gx * stride]]
+        dens, _, _ = np.histogram2d(np.clip(py, 0, None), np.clip(px, 0, None),
+                                    bins=[gy, gx], range=rng_, weights=wts)
+        tis, _, _ = np.histogram2d(np.clip(ys, 0, None), np.clip(xs, 0, None),
+                                   bins=[gy, gx], range=rng_)
+
+        def _wsum(m, k):
+            ii = np.pad(m.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+            return ii[k:, k:] - ii[:-k, k:] - ii[k:, :-k] + ii[:-k, :-k]
+
+        k = max(int(size // stride), 1)
+        dens_w = _wsum(dens, k)
+        tis_w = _wsum(tis, k)
+        bins_full = (size / pitch) ** 2
+        frac = tis_w / bins_full if bins_full > 0 else np.zeros_like(tis_w)
+        score = np.where(frac >= min_tissue_frac, dens_w, -1.0).astype(float)
+        if verbose:
+            print("[Log]: %d of %d windows are >= %.0f%% in tissue"
+                  % (int((score >= 0).sum()), score.size, 100 * min_tissue_frac))
+
+        rects, picked = [], []
+        sc_ = score.copy()
+        for r in range(1, n_crops + 1):
+            iy, ix = np.unravel_index(np.argmax(sc_), sc_.shape)
+            if sc_[iy, ix] < 0:
+                print("[Warning]: only %d eligible non-overlapping windows found" % (r - 1))
+                break
+            x0, y0 = ix * stride, iy * stride
+            rects.append((int(x0), int(y0), int(size), int(size)))
+            picked.append(dict(rank=r, x=int(x0), y=int(y0), w=int(size), h=int(size),
+                               density=float(dens_w[iy, ix]),
+                               tissue_frac=float(frac[iy, ix]),
+                               pct_of_tissue=100.0 * size * size / a_tissue))
+            sc_[max(0, iy - k + 1): iy + k, max(0, ix - k + 1): ix + k] = -1.0
+
+        self.dense_crop_table = pd.DataFrame(picked)
+        if verbose and len(picked):
+            print(self.dense_crop_table.to_string(index=False))
+            print("[Log]: total %.2f%% of tissue" % self.dense_crop_table.pct_of_tissue.sum())
+        return rects
+
+    def compute_transcript_scores_for_saved_runs(
+        self,
+        results_path,
+        output_dir_name="transcript_scores",
+        cell_col="assigned_cell_id",
+    ):
+        """Per-cell transcript deviation for every saved run.
+
+        For each run the expected depth is E = (total UMI in the crop) / (number of
+        reconstructed cells), and the score is mean |UMI_cell - E|. Lower is better: it
+        penalises both over-collection (bins pulled in from neighbours) and
+        under-collection. Computed before QC, like the connection score.
+        """
+        files = sorted(glob.glob(os.path.join(results_path, "*.h5ad")))
+        out_dir = os.path.join(results_path, output_dir_name)
+        os.makedirs(out_dir, exist_ok=True)
+        records = []
+        for f in files:
+            meta = self._parse_run_filename(f)
+            if meta is None:
+                print("[Skip]: filename not matched: %s" % os.path.basename(f))
+                continue
+            print("[Log]: Processing %s" % os.path.basename(f))
+            adata = sc.read_h5ad(f)
+            if cell_col not in adata.obs.columns:
+                print("[Skip]: no '%s' in %s" % (cell_col, os.path.basename(f)))
+                continue
+            X = adata.X
+            umi = np.asarray(X.sum(axis=1)).ravel() if sp.issparse(X) else np.asarray(X).sum(axis=1)
+            cells = adata.obs[cell_col].astype(str)
+            keep = ~cells.isin(["nan", "None", "", "0", "0.0"])
+            d = pd.DataFrame({"cell": cells[keep].values, "umi": umi[np.asarray(keep)]})
+            percell = d.groupby("cell")["umi"].sum()
+            n_cells = int(percell.shape[0])
+            total = float(umi.sum())
+            expected = total / n_cells if n_cells else np.nan
+            absdev = (percell - expected).abs()
+            pd.DataFrame({"cell": percell.index, "umi": percell.values,
+                          "expected": expected, "absdev": absdev.values}).to_csv(
+                os.path.join(out_dir, os.path.basename(f).replace(".h5ad", "_transcript.csv")),
+                index=False)
+            records.append({**meta, "n_cells": n_cells, "total_umi": total,
+                            "expected_umi": expected,
+                            "percell_mean_absdev": float(absdev.mean()),
+                            "percell_median_umi": float(percell.median())})
+        summary = pd.DataFrame(records)
+        out_csv = os.path.join(out_dir, "transcript_score_summary_per_run.csv")
+        summary.to_csv(out_csv, index=False)
+        print("[Log]: Saved per-run summary to %s" % out_csv)
+        return summary
+
+    def summarize_transcript_across_crops(self, tpc_run_summary):
+        """Mean per-cell transcript deviation across crops, for each (L, S)."""
+        return (tpc_run_summary.copy()
+                .groupby(["L", "S"], as_index=False)
+                .agg(mean_absdev=("percell_mean_absdev", "mean"),
+                     n_runs=("percell_mean_absdev", "size")))
+
+    def plot_score_heatmap(
+        self,
+        summary_df,
+        value_col,
+        title,
+        higher_is_better=True,
+        out_png=None,
+        out_svg=None,
+        figsize=(6.4, 5.0),
+        decimals=2,
+        cbar_label=None,
+    ):
+        """One (S, L) heatmap for a single score, best cell highlighted.
+
+        `summary_df` must carry columns S, L and `value_col`. The single best cell is
+        outlined solid yellow; any cell equal to it once rounded to `decimals` is outlined
+        dashed white, so a near-tie is not read as a clear winner.
+        """
+        piv = summary_df.set_index(["S", "L"])[value_col].unstack()
+        v = piv.values.astype(float)
+        vr = np.round(v, decimals)
+        if higher_is_better:
+            best = np.unravel_index(np.nanargmax(v), v.shape)
+            bestr = np.nanmax(vr)
+            cmap = "viridis"
+        else:
+            best = np.unravel_index(np.nanargmin(v), v.shape)
+            bestr = np.nanmin(vr)
+            cmap = "viridis_r"
+
+        fig, ax = plt.subplots(figsize=figsize)
+        im = ax.imshow(v, cmap=cmap, aspect="auto")
+        ties = []
+        for i in range(v.shape[0]):
+            for j in range(v.shape[1]):
+                if not np.isfinite(v[i, j]):
+                    continue
+                is_best = (i, j) == best
+                tied = vr[i, j] == bestr
+                if is_best:
+                    ax.add_patch(Rectangle((j - .5, i - .5), 1, 1, fill=False,
+                                           ec="yellow", lw=3))
+                elif tied:
+                    ax.add_patch(Rectangle((j - .5, i - .5), 1, 1, fill=False,
+                                           ec="white", lw=2.5, ls="--"))
+                    ties.append("S%g/L%g" % (piv.index[i], piv.columns[j]))
+                ax.text(j, i, ("%." + str(decimals) + "f") % vr[i, j],
+                        ha="center", va="center", fontsize=9,
+                        color="black" if is_best else "white",
+                        fontweight="bold" if tied else "normal")
+        ax.set_xticks(range(len(piv.columns)))
+        ax.set_xticklabels(piv.columns)
+        ax.set_yticks(range(len(piv.index)))
+        ax.set_yticklabels(piv.index)
+        ax.set_xlabel("Spatial weight, L")
+        ax.set_ylabel("Search radius, S")
+        if not ties:
+            tie_txt = "none"
+        elif len(ties) <= 4:
+            tie_txt = "  ".join(ties)
+        else:
+            tie_txt = "%s  (+%d more)" % ("  ".join(ties[:4]), len(ties) - 4)
+        sub = ("best S=%g, L=%g; equal at %d dp: %s"
+               % (piv.index[best[0]], piv.columns[best[1]], decimals, tie_txt))
+        ax.set_title(title + chr(10) + sub, fontsize=11)
+        cb = fig.colorbar(im, ax=ax, fraction=0.046)
+        if cbar_label:
+            cb.set_label(cbar_label)
+        fig.tight_layout()
+        for p_ in (out_png, out_svg):
+            if p_:
+                fig.savefig(p_, bbox_inches="tight", facecolor="white", dpi=200)
+                print("[Log]: saved %s" % p_)
+        return piv
+
+    def plot_connection_transcript_composite(
+        self,
+        conn_summary_df,
+        tpc_summary_df,
+        out_png=None,
+        out_svg=None,
+        figsize=(18, 5.6),
+        decimals=2,
+    ):
+        """Ground-truth-free composite: spatial connectivity + transcript consistency.
+
+        Both terms are min-max normalised over the (S, L) grid and added, so the sum runs
+        0-2 and higher is better. The transcript term is inverted first, because a low
+        deviation is good. The single best cell is outlined solid yellow; any cell equal
+        to it once rounded to `decimals` is outlined dashed white, so a near-tie is not
+        read as a clear winner.
+        """
+        # summarize_connection_across_crops returns 'mean_conn'; the per-run table uses
+        # 'mean_connection_score'. Accept either so both can be passed in.
+        _cc = next((c for c in ("mean_conn", "mean_connection_score")
+                    if c in conn_summary_df.columns), None)
+        if _cc is None:
+            raise ValueError("no connection column found in conn_summary_df; "
+                             "expected 'mean_conn' or 'mean_connection_score'")
+        _tc = next((c for c in ("mean_absdev", "percell_mean_absdev")
+                    if c in tpc_summary_df.columns), None)
+        if _tc is None:
+            raise ValueError("no transcript column found in tpc_summary_df")
+        cn = conn_summary_df.set_index(["S", "L"])[_cc]
+        tp = tpc_summary_df.set_index(["S", "L"])[_tc]
+        d = pd.DataFrame({"connection": cn, "transcript_dev": tp}).dropna()
+        if d.empty:
+            raise ValueError("No overlapping (S, L) between the two summaries.")
+
+        def mm(x):
+            lo, hi = x.min(), x.max()
+            return (x - lo) / (hi - lo) if hi > lo else x * 0.0
+
+        d["n_conn"] = mm(d.connection)
+        d["n_tpc"] = 1.0 - mm(d.transcript_dev)
+        d["sum"] = d.n_conn + d.n_tpc
+
+        t1 = "Mean per-cell spatial connectivity" + chr(10) + "|largest 8-connected component| / |all bins|"
+        t2 = "Mean per-cell transcript consistency" + chr(10) + "1 - mean |UMI - expected|"
+        t3 = "Combined score (0-2)"
+        fig, axes = plt.subplots(1, 3, figsize=figsize)
+        for ax, (col, title) in zip(axes, [("n_conn", t1), ("n_tpc", t2), ("sum", t3)]):
+            piv = d[col].unstack()
+            v = piv.values.astype(float)
+            vr = np.round(v, decimals)
+            best = np.unravel_index(np.nanargmax(v), v.shape)
+            bestr = np.nanmax(vr)
+            im = ax.imshow(v, cmap="viridis", aspect="auto")
+            ties = []
+            for i in range(v.shape[0]):
+                for j in range(v.shape[1]):
+                    if not np.isfinite(v[i, j]):
+                        continue
+                    is_best = (i, j) == best
+                    tied = vr[i, j] == bestr
+                    if is_best:
+                        ax.add_patch(Rectangle((j - .5, i - .5), 1, 1, fill=False,
+                                               ec="yellow", lw=3))
+                    elif tied:
+                        ax.add_patch(Rectangle((j - .5, i - .5), 1, 1, fill=False,
+                                               ec="white", lw=2.5, ls="--"))
+                        ties.append("S%g/L%g" % (piv.index[i], piv.columns[j]))
+                    ax.text(j, i, ("%." + str(decimals) + "f") % vr[i, j],
+                            ha="center", va="center", fontsize=9,
+                            color="black" if is_best else "white",
+                            fontweight="bold" if tied else "normal")
+            ax.set_xticks(range(len(piv.columns)))
+            ax.set_xticklabels(piv.columns)
+            ax.set_yticks(range(len(piv.index)))
+            ax.set_yticklabels(piv.index)
+            ax.set_xlabel("Spatial weight, L")
+            ax.set_ylabel("Search radius, S")
+            if not ties:
+                tie_txt = "none"
+            elif len(ties) <= 4:
+                tie_txt = "  ".join(ties)
+            else:
+                tie_txt = "%s  (+%d more)" % ("  ".join(ties[:4]), len(ties) - 4)
+            sub = ("best S=%g, L=%g; equal at %d dp: %s"
+                   % (piv.index[best[0]], piv.columns[best[1]], decimals, tie_txt))
+            ax.set_title(title + chr(10) + sub, fontsize=10)
+            fig.colorbar(im, ax=ax, fraction=0.046)
+        sup = ("Ground-truth-free parameter selection: spatial connectivity + transcript "
+               "consistency" + chr(10) +
+               "each min-max normalised over the grid, then added (computed before QC)")
+        fig.suptitle(sup, fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.90])
+        for p_ in (out_png, out_svg):
+            if p_:
+                fig.savefig(p_, bbox_inches="tight", facecolor="white", dpi=200)
+                print("[Log]: saved %s" % p_)
+        s = d["sum"]
+        print("[Log]: best combined S=%g, L=%g (%.4f)"
+              % (s.idxmax()[0], s.idxmax()[1], s.max()))
+        return d.reset_index()
+
     def generate_random_crops(
         self,
         n_crops=5,
@@ -1602,6 +2076,102 @@ class STCS:
 
         return rects
     
+    def plot_crop_overview(
+        self,
+        rects,
+        density_source="auto",
+        labels_key="labels_he",
+        bin_px=100,
+        use_image=False,
+        save_file=None,
+        figsize=(16, 7.5),
+        point_size=0.05,
+    ):
+        """Show where the crops sit on the tissue, next to the density that chose them.
+
+        Left panel  : every bin as a faint point, so the tissue outline is visible, with
+                      the crop boxes drawn on top and numbered in pick order.
+        Right panel : the density map the ranking used, on the same axes.
+
+        Unlike plot_crop_rectangles this does not load the full-resolution H&E image,
+        which is several GB; set use_image=True if you do want it as the backdrop.
+        """
+        adata = self.adata
+        if "spatial" not in adata.obsm:
+            raise ValueError("No spatial coordinates in adata.obsm['spatial'].")
+        xy = np.asarray(adata.obsm["spatial"], dtype=float)
+        xs, ys = xy[:, 0], xy[:, 1]
+
+        src = density_source
+        if src == "auto":
+            src = "nuclei" if labels_key in adata.obs.columns else "counts"
+        if src == "nuclei":
+            lab = adata.obs[labels_key].values
+            keep = np.asarray([(v == v) and str(v) not in ("0", "0.0", "nan", "None")
+                               for v in lab])
+            df = pd.DataFrame({"lab": lab[keep], "x": xs[keep], "y": ys[keep]})
+            cent = df.groupby("lab")[["x", "y"]].mean()
+            px, py, wts = cent["x"].values, cent["y"].values, None
+            dens_label = "nuclei per %d px cell" % bin_px
+        else:
+            X = adata.X
+            wts = (np.asarray(X.sum(axis=1)).ravel() if sp.issparse(X)
+                   else np.asarray(X).sum(axis=1))
+            px, py = xs, ys
+            dens_label = "transcripts per %d px cell" % bin_px
+
+        gx = int(np.ceil((max(xs.max(), px.max()) + bin_px) / bin_px))
+        gy = int(np.ceil((max(ys.max(), py.max()) + bin_px) / bin_px))
+        rng_ = [[0, gy * bin_px], [0, gx * bin_px]]
+        dens, _, _ = np.histogram2d(np.clip(py, 0, None), np.clip(px, 0, None),
+                                    bins=[gy, gx], range=rng_, weights=wts)
+
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        cmap = plt.get_cmap("tab10", max(1, len(rects)))
+
+        ax = axes[0]
+        if use_image:
+            img = self.load_img()
+            if img is not None:
+                ax.imshow(img)
+        ax.scatter(xs, ys, s=point_size, c="#b0b0b0", linewidths=0, rasterized=True)
+        ax.set_title("Crop locations on tissue", fontsize=13, fontweight="bold")
+
+        ax2 = axes[1]
+        pos = dens[dens > 0]
+        vmax = np.percentile(pos, 99) if pos.size else None
+        im = ax2.imshow(dens, origin="upper", cmap="magma", vmax=vmax,
+                        extent=[0, gx * bin_px, gy * bin_px, 0])
+        ax2.set_title("Density used for ranking", fontsize=13, fontweight="bold")
+        cb = fig.colorbar(im, ax=ax2, fraction=0.04)
+        cb.set_label(dens_label)
+
+        tab = getattr(self, "dense_crop_table", None)
+        for a in (ax, ax2):
+            for i, (x, y, w, h) in enumerate(rects):
+                c = cmap(i)
+                a.add_patch(Rectangle((x, y), w, h, fill=False, edgecolor=c, lw=2.2))
+                lbl = "crop %d" % (i + 1)
+                if tab is not None and i < len(tab):
+                    lbl += "  %.1f%%" % tab.iloc[i]["pct_of_tissue"]
+                a.text(x + 20, y - 40, lbl, color=c, fontsize=10, fontweight="bold",
+                       bbox=dict(facecolor="white", alpha=0.65, edgecolor="none", pad=1.5))
+            a.set_aspect("equal")
+            a.set_xticks([]); a.set_yticks([])
+            for spine in a.spines.values():
+                spine.set_visible(False)
+        ax.invert_yaxis()
+
+        total = ""
+        if tab is not None and len(tab):
+            total = "  (%d crops, %.2f%% of tissue)" % (len(tab), tab.pct_of_tissue.sum())
+        fig.suptitle("Parameter-tuning crops%s" % total, fontsize=14)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        if save_file:
+            fig.savefig(save_file, dpi=200, bbox_inches="tight", facecolor="white")
+            print("[Log]: saved %s" % save_file)
+        return fig
+
     def plot_crop_rectangles(self, rects, save_file=None, figsize=(12, 12)):
         """
         Plot crop rectangles on the full-resolution image.
@@ -1655,31 +2225,72 @@ class STCS:
         pseudobulk_mode="mean",
         use_sc_ref=True,
         normalize_distances=True,
-        feature_name=True
+        feature_name=True,
+        precomputed_labels=None
     ):
         """
         Run one crop + one (search_radius, lambda) combination.
+
+        precomputed_labels : path to an .h5ad carrying .obs['labels_he'] for the whole
+            slide. When given, StarDist is skipped and those labels are reused, which is
+            the equivalent of newMethod's skipb2c=True.
         Keeps only the final h5ad file.
         """
         x, y, w, h = rect
         x1, x2, y1, y2 = self._rect_to_xyxy(rect)
 
         run_name = f"crop{crop_id:02d}_x{x}_y{y}_w{w}_h{h}_S{search_radius}_L{lam}"
-        tmp_dir = os.path.join(tmp_root, run_name)
+
+        # The scratch directory carries the process id. Without it two sweeps running at
+        # once share a path, and the one that finishes first deletes the other's working
+        # directory in its cleanup, destroying a run mid-flight.
+        tmp_dir = os.path.join(tmp_root, f"{run_name}__pid{os.getpid()}")
         os.makedirs(tmp_dir, exist_ok=True)
 
         final_h5ad = os.path.join(results_dir, f"{run_name}.h5ad")
+
+        # Resume: an existing output counts as done only if it actually carries the
+        # assignment. A run can leave a well-formed file without it, and trusting mere
+        # existence would skip that run forever and break the scoring downstream.
+        if os.path.exists(final_h5ad) and not self._run_output_is_complete(final_h5ad):
+            print(f"[Log]: {run_name} exists but has no assignment - redoing it")
+            try:
+                os.remove(final_h5ad)
+            except OSError as _e:
+                print(f"[Warning]: could not remove {final_h5ad}: {_e}")
+
+        if os.path.exists(final_h5ad):
+            print(f"[Log]: skipping {run_name}, output already exists")
+            return {
+                "run_name": run_name,
+                "crop_id": crop_id,
+                "x": x, "y": y, "w": w, "h": h,
+                "x1": x1, "x2": x2, "y1": y1, "y2": y2,
+                "search_radius": search_radius,
+                "lambda": lam,
+                "n_spots": None,
+                "n_genes": None,
+                "output_h5ad": final_h5ad,
+                "status": "success",
+            }
 
         try:
             crop_data = self.crop(x1, x2, y1, y2, factor=factor)
             if crop_data is None:
                 raise RuntimeError(f"Cropping failed for {run_name}")
 
-            crop_data = crop_data.run_stardist_pipeline(
-                path=tmp_dir,
-                prob_thresh=prob_thresh,
-                factor=factor
-            )
+            if precomputed_labels is not None:
+                crop_data = crop_data.attach_precomputed_labels(
+                    path=tmp_dir,
+                    labels_h5ad=precomputed_labels,
+                    verbose=False
+                )
+            else:
+                crop_data = crop_data.run_stardist_pipeline(
+                    path=tmp_dir,
+                    prob_thresh=prob_thresh,
+                    factor=factor
+                )
 
             crop_data = crop_data.create_pseudobulk_from_stardist(
                 output_path=tmp_dir,
@@ -1701,7 +2312,24 @@ class STCS:
                     train_celltypist_model=False
                 )
 
+            # The paired H&E image travels in .uns['spatial'][...]['images'] and is
+            # ~3.2 GB per crop, while the data the scores actually need (sparse counts,
+            # coordinates, assignments) is ~15 MB. Saving it for every parameter
+            # combination turned a 30-run sweep into ~100 GB and filled the disk.
+            try:
+                for _k in list((crop_data.adata.uns.get("spatial") or {}).keys()):
+                    crop_data.adata.uns["spatial"][_k].pop("images", None)
+            except Exception as _e:
+                print("[Warning]: could not strip image from uns: %s" % _e)
+
             crop_data.adata.write_h5ad(final_h5ad)
+
+            if "assigned_cell_id" not in crop_data.adata.obs.columns:
+                # Reporting success here would hide the problem in run_summary.csv and
+                # leave a file that resume keeps skipping.
+                raise RuntimeError(
+                    "assignment produced no 'assigned_cell_id' column for %s" % run_name
+                )
 
             out = {
                 "run_name": run_name,
@@ -1750,7 +2378,9 @@ class STCS:
         use_sc_ref=True,
         normalize_distances=True,
         feature_name=True,
-        summary_csv_name="run_summary.csv"
+        summary_csv_name="run_summary.csv",
+        precomputed_labels=None,
+        n_jobs=1,
     ):
         """
         Run all crop x search_radius x lambda combinations.
@@ -1763,6 +2393,21 @@ class STCS:
             List of search radius values
         lambdas : list
             List of lambda values
+        n_jobs : int, default 1
+            Number of runs to execute at once. 1 runs serially. -1 uses every core,
+            -2 all but one, and so on. Workers are forked, so the loaded dataset is
+            shared copy-on-write rather than pickled to each child.
+
+            Each run is independent - its own crop, its own temporary directory and its
+            own output file - so there is nothing to coordinate between them. Pick n_jobs
+            from memory rather than cores: every worker holds one cropped dataset at a
+            time, so peak usage is roughly n_jobs x the size of one crop.
+
+        Resuming
+        --------
+        A run whose output .h5ad already exists is skipped, so an interrupted sweep is
+        resumed by calling this again with the same arguments. The count of completed
+        runs is reported before the sweep starts.
         """
         os.makedirs(results_dir, exist_ok=True)
 
@@ -1770,35 +2415,68 @@ class STCS:
             tmp_root = os.path.join(results_dir, "_tmp_runs")
         os.makedirs(tmp_root, exist_ok=True)
 
-        all_results = []
         param_grid = list(itertools.product(search_radii, lambdas))
+        tasks = [(ci, rect, sr, lam)
+                 for ci, rect in enumerate(rects, start=1)
+                 for sr, lam in param_grid]
 
+        # Resume: a run whose output already exists is finished. Report it up front so
+        # the remaining work is visible, rather than discovering it run by run.
+        done = [t for t in tasks
+                if os.path.exists(os.path.join(
+                    results_dir, "crop%02d_x%d_y%d_w%d_h%d_S%s_L%s.h5ad"
+                    % (t[0], t[1][0], t[1][1], t[1][2], t[1][3], t[2], t[3])))]
         print(f"[Log]: Number of crops = {len(rects)}")
         print(f"[Log]: Number of parameter combinations per crop = {len(param_grid)}")
-        print(f"[Log]: Total runs = {len(rects) * len(param_grid)}")
+        print(f"[Log]: Total runs = {len(tasks)}")
+        if done:
+            print(f"[Log]: Resuming: {len(done)} already complete, {len(tasks) - len(done)} to run")
 
-        for crop_idx, rect in enumerate(rects, start=1):
-            print("=" * 80)
-            print(f"[Log]: Running crop {crop_idx}/{len(rects)} | rect={rect}")
-            print("=" * 80)
+        kw = dict(
+            results_dir=results_dir,
+            tmp_root=tmp_root,
+            run_celltypist=run_celltypist,
+            prob_thresh=prob_thresh,
+            factor=factor,
+            pseudobulk_mode=pseudobulk_mode,
+            use_sc_ref=use_sc_ref,
+            normalize_distances=normalize_distances,
+            feature_name=feature_name,
+            precomputed_labels=precomputed_labels,
+        )
 
-            for s, lam in param_grid:
-                print(f"[Log]: crop={crop_idx}, S={s}, L={lam}")
+        if n_jobs and n_jobs != 1:
+            import multiprocessing as mp
 
+            if n_jobs < 0:
+                n_jobs = max(1, (os.cpu_count() or 1) + 1 + n_jobs)
+            n_jobs = max(1, min(n_jobs, len(tasks)))
+
+            # Each worker's BLAS would otherwise spawn its own thread pool and the
+            # processes would fight over the cores, making the sweep slower than serial.
+            for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                      "NUMEXPR_NUM_THREADS"):
+                os.environ.setdefault(v, "1")
+
+            _SWEEP_CTX["self"] = self
+            _SWEEP_CTX["kw"] = kw
+            print(f"[Log]: Running {len(tasks)} runs across {n_jobs} processes")
+
+            # fork, so the loaded dataset is inherited copy-on-write instead of pickled
+            ctx = mp.get_context("fork")
+            all_results = []
+            with ctx.Pool(processes=n_jobs) as pool:
+                for i, result in enumerate(pool.imap_unordered(_sweep_worker, tasks), 1):
+                    all_results.append(result)
+                    print(f"[Log]: ({i}/{len(tasks)}) {result['run_name']} -> {result['status']}",
+                          flush=True)
+            _SWEEP_CTX.clear()
+        else:
+            all_results = []
+            for i, (crop_idx, rect, sr, lam) in enumerate(tasks, 1):
+                print(f"[Log]: ({i}/{len(tasks)}) crop={crop_idx}, S={sr}, L={lam}")
                 result = self.run_single_crop_parameter_set(
-                    rect=rect,
-                    crop_id=crop_idx,
-                    search_radius=s,
-                    lam=lam,
-                    results_dir=results_dir,
-                    tmp_root=tmp_root,
-                    run_celltypist=run_celltypist,
-                    prob_thresh=prob_thresh,
-                    factor=factor,
-                    pseudobulk_mode=pseudobulk_mode,
-                    use_sc_ref=use_sc_ref,
-                    normalize_distances=normalize_distances,
-                    feature_name=feature_name
+                    rect=rect, crop_id=crop_idx, search_radius=sr, lam=lam, **kw
                 )
                 all_results.append(result)
                 print(f"[Log]: {result['status']}")
@@ -1810,6 +2488,20 @@ class STCS:
         print(f"[Log]: Sweep finished. Summary saved to {summary_csv}")
         return summary_df
     
+    @staticmethod
+    def _run_output_is_complete(path, cell_col="assigned_cell_id"):
+        """True if a saved run carries its assignment column.
+
+        Read through h5py rather than scanpy: this runs once per file on resume, and
+        only the obs keys are needed. A file that cannot be opened at all - a run killed
+        mid-write - is also incomplete.
+        """
+        try:
+            with File(path, "r") as h:
+                return cell_col in h["obs"]
+        except Exception:
+            return False
+
     def _rectangles_overlap(self, rect1, rect2, min_gap=0):
         """
         Check whether two rectangles overlap.
@@ -1895,6 +2587,203 @@ class STCS:
         return largest
     
     
+    # ========== GEOMETRIC VALIDATION AGAINST AN IMAGING REFERENCE ==========
+
+    @staticmethod
+    def _hull_polygons(df, x_col, y_col, id_col, min_points=3):
+        """Convex hull of the points belonging to each id. Cells with fewer than
+        `min_points` members cannot form a polygon and are dropped."""
+        rows = []
+        for cid, g in df.groupby(id_col, sort=False):
+            if len(g) < min_points:
+                continue
+            p = MultiPoint(list(zip(g[x_col].values, g[y_col].values))).convex_hull
+            if p.geom_type == "Polygon" and not p.is_empty:
+                rows.append({"cell_id": str(cid), "geometry": p})
+        return gpd.GeoDataFrame(rows, geometry="geometry")
+
+    @staticmethod
+    def _best_overlap_map(ga, gb):
+        """For each polygon in ga, the polygon in gb with the largest IoU."""
+        sb = gb.sindex
+        bg = gb.geometry.values
+        bid = gb.cell_id.values
+        out = {}
+        for aid, ag in zip(ga.cell_id.values, ga.geometry.values):
+            best, bi = 0.0, None
+            for j in sb.intersection(ag.bounds):
+                inter = ag.intersection(bg[j]).area
+                if inter == 0:
+                    continue
+                iou = inter / (ag.area + bg[j].area - inter)
+                if iou > best:
+                    best, bi = iou, bid[j]
+            if bi is not None:
+                out[aid] = (bi, best)
+        return out
+
+    @classmethod
+    def _mutual_best_iou(cls, ga, gb):
+        """One-to-one matches: a's best is b AND b's best is a. No IoU threshold."""
+        f = cls._best_overlap_map(ga, gb)
+        r = cls._best_overlap_map(gb, ga)
+        return [(a, b, iou) for a, (b, iou) in f.items() if r.get(b, (None,))[0] == a]
+
+    @classmethod
+    def compute_iou_vs_reference_for_saved_runs(
+        cls,
+        results_path,
+        reference_vertices,
+        reference_categories=None,
+        output_dir_name="iou_vs_reference",
+        cell_col="assigned_cell_id",
+        ref_id_col="cell_id",
+        ref_x_col="x",
+        ref_y_col="y",
+        qc_min_gene_counts=3,
+        qc_min_cells_genes=50,
+        apply_qc=True,
+        verbose=False,
+    ):
+        """Per-cell IoU of every saved sweep run against an imaging reference.
+
+        This reuses the .h5ad files the parameter sweep already wrote, so nothing is
+        reconstructed again: the bin-to-cell assignment is read back, turned into cell
+        polygons, and matched one-to-one against reference cell polygons.
+
+        reference_vertices
+            DataFrame (or path to csv/parquet) of reference cell outlines with one row
+            per vertex: `ref_id_col`, `ref_x_col`, `ref_y_col`. The coordinates MUST be
+            in the same pixel frame as adata.obsm['spatial'], i.e. the reference has
+            already been registered onto the histology image.
+        reference_categories
+            optional {cell_id: category} mapping, e.g. Xenium's segmentation_method, so
+            the IoU can be reported per category as well as pooled.
+
+        Geometry: a cell is the convex hull of the bin centres assigned to it, and a
+        reference cell is the convex hull of its own vertices.
+
+            IoU = area(A and B) / area(A or B)
+
+        Matching is mutual-best-IoU with no threshold, so each reconstructed cell pairs
+        with at most one reference cell and vice versa.
+
+        Returns a tidy DataFrame with one row per (run, category).
+        """
+        if isinstance(reference_vertices, str):
+            reference_vertices = (pd.read_parquet(reference_vertices)
+                                  if reference_vertices.endswith(".parquet")
+                                  else pd.read_csv(reference_vertices))
+        ref = reference_vertices
+        for c in (ref_id_col, ref_x_col, ref_y_col):
+            if c not in ref.columns:
+                raise ValueError("reference_vertices needs column '%s'" % c)
+        ref = ref.copy()
+        ref[ref_id_col] = ref[ref_id_col].astype(str)
+
+        files = sorted(glob.glob(os.path.join(results_path, "*.h5ad")))
+        out_dir = os.path.join(results_path, output_dir_name)
+        os.makedirs(out_dir, exist_ok=True)
+        records = []
+
+        for f in files:
+            meta = cls._parse_run_filename(f)
+            if meta is None:
+                print("[Skip]: filename not matched: %s" % os.path.basename(f))
+                continue
+            adata = sc.read_h5ad(f)
+            if cell_col not in adata.obs.columns:
+                print("[Skip]: no '%s' in %s" % (cell_col, os.path.basename(f)))
+                continue
+
+            x1, x2 = meta["x"], meta["x"] + meta["w"]
+            y1, y2 = meta["y"], meta["y"] + meta["h"]
+            rc = ref[(ref[ref_x_col] >= x1) & (ref[ref_x_col] <= x2) &
+                     (ref[ref_y_col] >= y1) & (ref[ref_y_col] <= y2)]
+            g_ref = cls._hull_polygons(rc, ref_x_col, ref_y_col, ref_id_col)
+            if g_ref.empty:
+                print("[Skip]: no reference cells inside %s" % os.path.basename(f))
+                continue
+            g_ref["cat"] = (g_ref.cell_id.map(reference_categories)
+                            if reference_categories is not None else "ALL")
+
+            cells = adata.obs[cell_col].astype(str)
+            keep = ~cells.isin(["nan", "None", "", "0", "0.0"])
+            sub = adata[np.asarray(keep)].copy()
+            sub.obs["_cell"] = cells[keep].values
+
+            if apply_qc:
+                # same QC as the published pipeline, applied to the reconstructed cells
+                ids, inv = np.unique(sub.obs["_cell"].values, return_inverse=True)
+                agg = sp.coo_matrix((np.ones(sub.n_obs), (inv, np.arange(sub.n_obs))),
+                                    shape=(len(ids), sub.n_obs)).tocsr()
+                pb = ad.AnnData(X=agg.dot(sub.X), obs=pd.DataFrame(index=ids))
+                sc.pp.filter_genes(pb, min_counts=qc_min_gene_counts)
+                sc.pp.filter_cells(pb, min_genes=qc_min_cells_genes)
+                good = set(pb.obs_names)
+                sub = sub[sub.obs["_cell"].isin(good)].copy()
+
+            xy = np.asarray(sub.obsm["spatial"], dtype=float)
+
+            # The crop runs may store either global pixel coordinates or coordinates
+            # local to the crop (0..w, 0..h). Detect which, and shift local ones onto
+            # the global frame so they line up with the reference.
+            tol = 0.02 * max(meta["w"], meta["h"])
+            local = (xy[:, 0].min() >= -tol and xy[:, 0].max() <= meta["w"] + tol and
+                     xy[:, 1].min() >= -tol and xy[:, 1].max() <= meta["h"] + tol and
+                     (meta["x"] > tol or meta["y"] > tol))
+            if local:
+                xy = xy + np.array([meta["x"], meta["y"]], dtype=float)
+            if verbose:
+                print("[Log]: %s  frame=%s  bins x %.0f..%.0f  y %.0f..%.0f"
+                      % (os.path.basename(f), "crop-local" if local else "global",
+                         xy[:, 0].min(), xy[:, 0].max(), xy[:, 1].min(), xy[:, 1].max()))
+
+            dfp = pd.DataFrame({"cell": sub.obs["_cell"].values, "x": xy[:, 0], "y": xy[:, 1]})
+            g_rec = cls._hull_polygons(dfp, "x", "y", "cell")
+            if g_rec.empty:
+                print("[Skip]: no reconstructed polygons in %s" % os.path.basename(f))
+                continue
+
+            m = pd.DataFrame(cls._mutual_best_iou(g_rec, g_ref),
+                             columns=["recon_id", "ref_id", "iou"])
+            m["cat"] = m.ref_id.map(dict(zip(g_ref.cell_id, g_ref.cat)))
+            m.to_csv(os.path.join(out_dir,
+                     os.path.basename(f).replace(".h5ad", "_iou_pairs.csv")), index=False)
+
+            cats = ["ALL"] + ([c for c in sorted(g_ref.cat.dropna().unique())]
+                              if reference_categories is not None else [])
+            for cat in cats:
+                mm = m if cat == "ALL" else m[m.cat == cat]
+                n_ref = len(g_ref) if cat == "ALL" else int((g_ref.cat == cat).sum())
+                pr = len(mm) / len(g_rec) if len(g_rec) else np.nan
+                rc_ = len(mm) / n_ref if n_ref else np.nan
+                records.append({
+                    **meta, "category": cat,
+                    "n_recon": len(g_rec), "n_ref": n_ref, "n_matched": len(mm),
+                    "mean_iou": float(mm.iou.mean()) if len(mm) else np.nan,
+                    "median_iou": float(mm.iou.median()) if len(mm) else np.nan,
+                    "det_precision": pr, "det_recall": rc_,
+                    "det_f1": (2 * pr * rc_ / (pr + rc_)) if pr and rc_ else np.nan,
+                })
+            print("[Log]: %s  matched %d/%d  mean IoU %.4f"
+                  % (os.path.basename(f), len(m), len(g_ref),
+                     m.iou.mean() if len(m) else float("nan")), flush=True)
+
+        summary = pd.DataFrame(records)
+        out_csv = os.path.join(out_dir, "iou_summary_per_run.csv")
+        summary.to_csv(out_csv, index=False)
+        print("[Log]: Saved per-run IoU summary to %s" % out_csv)
+        return summary
+
+    @staticmethod
+    def summarize_iou_across_crops(iou_run_summary, category="ALL",
+                                   value="mean_iou"):
+        """Average the per-run IoU over crops, for each (L, S)."""
+        d = iou_run_summary[iou_run_summary.category == category]
+        return (d.groupby(["L", "S"], as_index=False)
+                 .agg(**{value: (value, "mean"), "n_crops": ("crop_id", "nunique")}))
+
     def compute_connection_scores_from_adata(
         self,
         adata,
@@ -1950,7 +2839,8 @@ class STCS:
 
         return out
     
-    def _parse_run_filename(self, path):
+    @staticmethod
+    def _parse_run_filename(path):
         """
         Parse filenames like:
         crop01_x500_y500_w3000_h3000_S3_L2.h5ad
@@ -2002,6 +2892,14 @@ class STCS:
 
             print(f"[Log]: Processing {os.path.basename(f)}")
             adata = sc.read_h5ad(f)
+
+            # A run can finish and still be missing its assignment column, e.g. if the
+            # assignment step bailed out. Skip it loudly rather than aborting the whole
+            # sweep's scoring over one bad file.
+            if cell_col not in adata.obs.columns:
+                print(f"[Skip]: '{cell_col}' absent in {os.path.basename(f)} - "
+                      f"delete this file and re-run the sweep to regenerate it")
+                continue
 
             conn_df = self.compute_connection_scores_from_adata(
                 adata=adata,
@@ -3555,12 +4453,12 @@ class STCS:
                 preds = celltypist.annotate(
                     pseudo,
                     model=model_path,
-                    majority_voting=True
+                    majority_voting=False
                 )
 
                 pred_adata = preds.to_adata()
 
-                ct_labels = pred_adata.obs["majority_voting"].astype(str)
+                ct_labels = pred_adata.obs["predicted_labels"].astype(str)
 
                 # map back to spots
                 adata.obs["celltypist_predicted_labels"] = adata.obs[cell_col].map(ct_labels)
